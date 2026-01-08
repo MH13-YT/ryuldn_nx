@@ -1,0 +1,7 @@
+{
+    "name": "RyuLDN",
+    "version": "0.0.1",
+    "creator": "ryuldn_nx",
+    "about": "Manage RyuLDN multiplayer settings\n\nFeatures:\n- View connection status\n- Enable/disable RyuLDN\n- Configure server settings\n- Manage passphrase\n- Network statistics",
+    "color": "#2E97FF"
+}
