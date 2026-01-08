@@ -1,122 +1,211 @@
 #---------------------------------------------------------------------------------
-# ryuldn_nx Tesla Overlay (.ovl) - COMPLÈTEMENT FONCTIONNEL
+.SUFFIXES:
 #---------------------------------------------------------------------------------
 
-.SUFFIXES:
-
 ifeq ($(strip $(DEVKITPRO)),)
-$(error "Please set DEVKITPRO in your environment. export DEVKITPRO=/opt/devkitpro")
+$(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/devkitpro")
 endif
 
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
-# Auto-detect Tesla
-LIBTESLA ?= $(DEVKITPRO)/libtesla
-ifeq ($(wildcard $(LIBTESLA)),)
-    LIBTESLA := ../libtesla
-endif
+#---------------------------------------------------------------------------------
+# TARGET is the name of the output
+# BUILD is the directory where object files & intermediate files will be placed
+# SOURCES is a list of directories containing source code
+# DATA is a list of directories containing data files
+# INCLUDES is a list of directories containing header files
+# ROMFS is the directory containing data to be added to RomFS, relative to the Makefile (Optional)
+#
+# NO_ICON: if set to anything, do not use icon.
+# NO_NACP: if set to anything, no .nacp file is generated.
+# APP_TITLE is the name of the app stored in the .nacp file (Optional)
+# APP_AUTHOR is the author of the app stored in the .nacp file (Optional)
+# APP_VERSION is the version of the app stored in the .nacp file (Optional)
+# APP_TITLEID is the titleID of the app stored in the .nacp file (Optional)
+# ICON is the filename of the icon (.jpg), relative to the project folder.
+#   If not set, it attempts to use one of the following (in this order):
+#     - <Project name>.jpg
+#     - icon.jpg
+#     - <libnx folder>/default_icon.jpg
+#
+# CONFIG_JSON is the filename of the NPDM config file (.json), relative to the project folder.
+#   If not set, it attempts to use one of the following (in this order):
+#     - <Project name>.json
+#     - config.json
+#   If a JSON file is provided or autodetected, an ExeFS PFS0 (.nsp) is built instead
+#   of a homebrew executable (.nro). This is intended to be used for sysmodules.
+#   NACP building is skipped as well.
+#---------------------------------------------------------------------------------
+TARGET_VERSION := $(shell git describe --tags --dirty)
+VERSION_DEFINES	:= -DGITDESCVER="\"${TARGET_VERSION}\""
 
-TARGET_VERSION := $(shell git describe --tags --dirty 2>/dev/null || echo "v1.0.0-dev")
-VERSION_DEFINES := -DGITDESCVER="\"${TARGET_VERSION}\""
+APP_TITLE	:=	ldn_mitm
+APP_VERSION :=	${TARGET_VERSION}
 
-TARGET      := ovlRyuLDN
-BUILD       := build
-SOURCES     := source
-INCLUDES    := include ../common $(LIBTESLA)/include
+TARGET		:=	$(notdir $(CURDIR))
+BUILD		:=	build
+SOURCES		:=	source
+DATA		:=	data
+INCLUDES	:=	include ../libtesla/include
 
-NO_ICON     := 1
+NO_ICON		:=  1
 
 #---------------------------------------------------------------------------------
-ARCH        := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+# options for code generation
+#---------------------------------------------------------------------------------
+ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS      := -g -Wall -O2 -ffunction-sections \
-               $(ARCH) $(DEFINES) $(VERSION_DEFINES)
+CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
+			$(ARCH) $(DEFINES) $(VERSION_DEFINES)
 
-CFLAGS      += $(INCLUDE) -D__SWITCH__
+CFLAGS	+=	$(INCLUDE) -D__SWITCH__
 
-# TESLA OVERLAY FIX - CRUCIAL
-CFLAGS      += -DTSL_FB_WIDTH=1280 -DTSL_FB_HEIGHT=720 \
-               -DTSL_LAYER_WIDTH=1280 -DTSL_LAYER_HEIGHT=720 \
-               -DTSL_LAYER_X=0 -DTSL_LAYER_Y=0 -DTSL_USE_SINGLE_FB=1
+CXXFLAGS	:= $(CFLAGS) -fno-exceptions -std=c++20
 
-CXXFLAGS    := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17 -fpermissive
+ASFLAGS	:=	-g $(ARCH)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-ASFLAGS     := -g $(ARCH)
-LDFLAGS     := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) \
-               -Wl,--section-start,.text=0x40010000 -Wl,--build-id=sha1
-
-# LIBS TESLA + STB + NX
-LIBDIRS     := $(PORTLIBS) $(LIBNX) $(LIBTESLA)/lib $(ATMOSPHERELIBSDIR)/lib
-LIBS        := -ltsl -lnx -lmesosphere -lfs -lsf
+LIBS	:= -lnx
 
 #---------------------------------------------------------------------------------
-# Standard template reste identique
+# list of directories containing libraries, this must be the top level containing
+# include and lib
+#---------------------------------------------------------------------------------
+LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+
+
+#---------------------------------------------------------------------------------
+# no real need to edit anything past this point unless you need to add additional
+# rules for different file extensions
 #---------------------------------------------------------------------------------
 ifneq ($(BUILD),$(notdir $(CURDIR)))
+#---------------------------------------------------------------------------------
 
-export OUTPUT  := $(CURDIR)/$(TARGET)
-export TOPDIR  := $(CURDIR)
+export OUTPUT	:=	$(CURDIR)/$(TARGET)
+export TOPDIR	:=	$(CURDIR)
 
-export VPATH   := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
-             $(foreach dir,$(DATA),$(CURDIR)/$(dir))
+export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
+			$(foreach dir,$(DATA),$(CURDIR)/$(dir))
 
-export DEPSDIR := $(CURDIR)/$(BUILD)
+export DEPSDIR	:=	$(CURDIR)/$(BUILD)
 
-CFILES      := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
-CPPFILES    := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
-SFILES      := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
-BINFILES    := $(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
+BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
 
+#---------------------------------------------------------------------------------
+# use CXX for linking C++ projects, CC for standard C
+#---------------------------------------------------------------------------------
 ifeq ($(strip $(CPPFILES)),)
-    export LD := $(CC)
+#---------------------------------------------------------------------------------
+	export LD	:=	$(CC)
+#---------------------------------------------------------------------------------
 else
-    export LD := $(CXX)
+#---------------------------------------------------------------------------------
+	export LD	:=	$(CXX)
+#---------------------------------------------------------------------------------
+endif
+#---------------------------------------------------------------------------------
+
+export OFILES_BIN	:=	$(addsuffix .o,$(BINFILES))
+export OFILES_SRC	:=	$(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
+export OFILES 	:=	$(OFILES_BIN) $(OFILES_SRC)
+export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
+
+export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
+			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+			-I$(CURDIR)/$(BUILD)
+
+export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+ifeq ($(strip $(CONFIG_JSON)),)
+	jsons := $(wildcard *.json)
+	ifneq (,$(findstring $(TARGET).json,$(jsons)))
+		export APP_JSON := $(TOPDIR)/$(TARGET).json
+	else
+		ifneq (,$(findstring config.json,$(jsons)))
+			export APP_JSON := $(TOPDIR)/config.json
+		endif
+	endif
+else
+	export APP_JSON := $(TOPDIR)/$(CONFIG_JSON)
 endif
 
-export OFILES_BIN  := $(addsuffix .o,$(BINFILES))
-export OFILES_SRC  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
-export OFILES      := $(OFILES_BIN) $(OFILES_SRC)
-export HFILES_BIN  := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+ifeq ($(strip $(ICON)),)
+	icons := $(wildcard *.jpg)
+	ifneq (,$(findstring $(TARGET).jpg,$(icons)))
+		export APP_ICON := $(TOPDIR)/$(TARGET).jpg
+	else
+		ifneq (,$(findstring icon.jpg,$(icons)))
+			export APP_ICON := $(TOPDIR)/icon.jpg
+		endif
+	endif
+else
+	export APP_ICON := $(TOPDIR)/$(ICON)
+endif
 
-export INCLUDE     := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
-                  $(foreach dir,$(LIBDIRS),-I$(dir)/include) \
-                  -I$(CURDIR)/$(BUILD)
+ifeq ($(strip $(NO_ICON)),)
+	export NROFLAGS += --icon=$(APP_ICON)
+endif
 
-export LIBPATHS    := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+ifeq ($(strip $(NO_NACP)),)
+	export NROFLAGS += --nacp=$(CURDIR)/$(TARGET).nacp
+endif
+
+ifneq ($(APP_TITLEID),)
+	export NACPFLAGS += --titleid=$(APP_TITLEID)
+endif
+
+ifneq ($(ROMFS),)
+	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
+endif
 
 .PHONY: $(BUILD) clean all
 
+#---------------------------------------------------------------------------------
 all: $(BUILD)
+
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
+#---------------------------------------------------------------------------------
 clean:
-	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).*.ovl $(TARGET).*.elf $(TARGET).*~ 
+	@rm -fr $(BUILD) $(TARGET).ovl $(TARGET).nro $(TARGET).nacp $(TARGET).elf
 
-else
-
-DEPENDS	:= $(OFILES:.o=.d)
 
 #---------------------------------------------------------------------------------
-all: $(OUTPUT).ovl
+else
+.PHONY:	all
 
-$(OUTPUT).ovl: $(OUTPUT).elf
-	@$(DEVKITPRO)/devkitA64/bin/elf2nro $< $@ --singleNsoTarget 1
-	@echo "built ... $(notdir $@)"
+DEPENDS	:=	$(OFILES:.o=.d)
 
-$(OUTPUT).elf: $(OFILES)
+#---------------------------------------------------------------------------------
+# main targets
+#---------------------------------------------------------------------------------
+all	:	 $(OUTPUT).ovl
 
-$(OFILES_SRC): $(HFILES_BIN)
+$(OUTPUT).ovl		:	$(OUTPUT).elf $(OUTPUT).nacp 
+	@elf2nro $< $@ $(NROFLAGS)
+	@echo "built ... $(notdir $(OUTPUT).ovl)"
 
-%.bin.o %_bin.h : %.bin
+$(OUTPUT).elf	:	$(OFILES)
+
+$(OFILES_SRC)	: $(HFILES_BIN)
+
+#---------------------------------------------------------------------------------
+# you need a rule like this for each extension you use as binary data
+#---------------------------------------------------------------------------------
+%.bin.o	%_bin.h :	%.bin
+#---------------------------------------------------------------------------------
 	@echo $(notdir $<)
 	@$(bin2o)
 
 -include $(DEPENDS)
 
+#---------------------------------------------------------------------------------------
 endif
-#---------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------
