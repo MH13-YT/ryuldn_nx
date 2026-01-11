@@ -25,7 +25,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Create UDP socket
         _socket = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (_socket < 0) {
-            LogFormat("UPnP: Failed to create socket");
+            LOG_ERR(COMP_RLDN_UPNP,"Failed to create socket");
             return false;
         }
 
@@ -55,11 +55,11 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                              (struct sockaddr*)&addr, sizeof(addr));
 
         if (sent < 0) {
-            LogFormat("UPnP: Failed to send M-SEARCH");
+            LOG_ERR(COMP_RLDN_UPNP,"Failed to send M-SEARCH");
             return false;
         }
 
-        LogFormat("UPnP: Sent M-SEARCH discovery");
+        LOG_INFO(COMP_RLDN_UPNP,"Sent M-SEARCH discovery");
         return true;
     }
 
@@ -77,7 +77,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             const char* end = strstr(location, "\r\n");
             if (end) {
                 _gatewayUrl.assign(location, end - location);
-                LogFormat("UPnP: Found gateway at %s", _gatewayUrl.c_str());
+                LOG_INFO_ARGS(COMP_RLDN_UPNP,"Found gateway at %s", _gatewayUrl.c_str());
                 return FetchDeviceDescription(_gatewayUrl);
             }
         }
@@ -102,7 +102,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _controlUrl = location.substr(0, pathStart) + "/ctl/IPConn";
         }
 
-        LogFormat("UPnP: Control URL: %s", _controlUrl.c_str());
+        LOG_INFO_ARGS(COMP_RLDN_UPNP,"Control URL: %s", _controlUrl.c_str());
         _discovered = true;
         return true;
     }
@@ -124,7 +124,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     bool UpnpClient::DiscoverDevice() {
         std::scoped_lock lk(_mutex);
 
-        LogFormat("UPnP: Starting device discovery...");
+        LOG_INFO(COMP_RLDN_UPNP,"Starting device discovery...");
 
         if (!SendSsdpDiscovery()) {
             return false;
@@ -143,7 +143,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                 buffer[received] = '\0';
 
                 if (ParseSsdpResponse(buffer, received)) {
-                    LogFormat("UPnP: Device discovered successfully");
+                    LOG_INFO(COMP_RLDN_UPNP,"Device discovered successfully");
                     return true;
                 }
             } else if (received < 0) {
@@ -153,7 +153,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             }
         }
 
-        LogFormat("UPnP: No device found");
+        LOG_ERR(COMP_RLDN_UPNP,"No device found");
         return false;
     }
 
@@ -161,7 +161,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Parse control URL: http://host:port/path
         size_t protoEnd = _controlUrl.find("://");
         if (protoEnd == std::string::npos) {
-            LogFormat("UPnP: Invalid control URL");
+            LOG_ERR(COMP_RLDN_UPNP,"Invalid control URL");
             return false;
         }
 
@@ -192,12 +192,12 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             }
         }
 
-        LogFormat("UPnP: Connecting to %s:%d%s", host.c_str(), port, path.c_str());
+        LOG_INFO_ARGS(COMP_RLDN_UPNP,"Connecting to %s:%d%s", host.c_str(), port, path.c_str());
 
         // Create TCP socket
         s32 sock = ::socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
-            LogFormat("UPnP: Failed to create TCP socket");
+            LOG_ERR(COMP_RLDN_UPNP,"Failed to create TCP socket");
             return false;
         }
 
@@ -215,13 +215,13 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         addr.sin_port = htons(port);
 
         if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-            LogFormat("UPnP: Invalid host address");
+            LOG_ERR(COMP_RLDN_UPNP,"Invalid host address");
             close(sock);
             return false;
         }
 
         if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            LogFormat("UPnP: Connection failed");
+            LOG_ERR(COMP_RLDN_UPNP,"Connection failed");
             close(sock);
             return false;
         }
@@ -248,7 +248,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Send request
         ssize_t sent = send(sock, httpRequest, strlen(httpRequest), 0);
         if (sent < 0) {
-            LogFormat("UPnP: Failed to send HTTP request");
+            LOG_ERR(COMP_RLDN_UPNP,"Failed to send HTTP request");
             close(sock);
             return false;
         }
@@ -259,7 +259,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         close(sock);
 
         if (received <= 0) {
-            LogFormat("UPnP: Failed to receive response");
+            LOG_ERR(COMP_RLDN_UPNP,"Failed to receive response");
             return false;
         }
 
@@ -268,11 +268,11 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         // Check for HTTP 200 OK
         if (strstr(respBuffer, "200 OK") != nullptr) {
-            LogFormat("UPnP: %s successful", action.c_str());
+            LOG_INFO_ARGS(COMP_RLDN_UPNP,"%s successful", action.c_str());
             return true;
         }
 
-        LogFormat("UPnP: %s failed - %s", action.c_str(), respBuffer);
+        LOG_INFO_ARGS(COMP_RLDN_UPNP,"%s failed - %s", action.c_str(), respBuffer);
         return false;
     }
 
@@ -280,11 +280,11 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         std::scoped_lock lk(_mutex);
 
         if (!_discovered) {
-            LogFormat("UPnP: Device not discovered, cannot create port mapping");
+            LOG_ERR(COMP_RLDN_UPNP,"Device not discovered, cannot create port mapping");
             return false;
         }
 
-        LogFormat("UPnP: CreatePortMapping - Protocol=%d, Private=%u, Public=%u, Lease=%u",
+        LOG_INFO_ARGS(COMP_RLDN_UPNP,"CreatePortMapping - Protocol=%d, Private=%u, Public=%u, Lease=%u",
                  static_cast<int>(mapping.protocol),
                  mapping.privatePort,
                  mapping.publicPort,
@@ -293,10 +293,10 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Get local IP address
         std::string localIP;
         if (!GetLocalIPAddress(localIP)) {
-            LogFormat("UPnP: Failed to get local IP address");
+            LOG_ERR(COMP_RLDN_UPNP,"Failed to get local IP address");
             localIP = "192.168.1.100"; // Fallback
         }
-        LogFormat("UPnP: Using local IP: %s", localIP.c_str());
+        LOG_INFO_ARGS(COMP_RLDN_UPNP,"Using local IP: %s", localIP.c_str());
 
         // Build SOAP request body
         char soapBody[1024];
@@ -335,7 +335,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             return false;
         }
 
-        LogFormat("UPnP: DeletePortMapping - Protocol=%d, Public=%u",
+        LOG_INFO_ARGS(COMP_RLDN_UPNP,"DeletePortMapping - Protocol=%d, Public=%u",
                  static_cast<int>(mapping.protocol),
                  mapping.publicPort);
 

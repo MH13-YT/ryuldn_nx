@@ -40,19 +40,19 @@ namespace ams::mitm::ldn {
         public:
             ICommunicationService()
                 : state_event(nullptr),
-                  error_state(0),
-                  ryuldn_client(nullptr),
-                  ryuldn_proxy(nullptr),
-                  current_state(CommState::None),
-                  disconnect_reason(ryuldn::DisconnectReason::None)
+                error_state(0),
+                ryuldn_client(nullptr),
+                ryuldn_proxy(nullptr),
+                current_state(CommState::None),
+                disconnect_reason(ryuldn::DisconnectReason::None)
             {
-                LogFormat("ICommunicationService");
+                LOG_INFO(COMP_LDN_ICOM, "ICommunicationService");  // ✅ Corrigé
                 std::memset(&network_info, 0, sizeof(network_info));
                 std::memset(node_latest_updates, 0, sizeof(node_latest_updates));
             };
 
             ~ICommunicationService() {
-                LogFormat("~ICommunicationService");
+                LOG_INFO(COMP_LDN_ICOM, "~ICommunicationService");  // ✅ Corrigé
                 if (this->state_event != nullptr) {
                     delete this->state_event;
                     this->state_event = nullptr;
@@ -66,6 +66,7 @@ namespace ams::mitm::ldn {
                     this->ryuldn_client = nullptr;
                 }
             };
+
         private:
             void onEventFired();
         // private:
@@ -102,6 +103,7 @@ namespace ams::mitm::ldn {
             Result SetStationAcceptPolicy(u8 policy);
             Result InitializeSystem2(u64 unk, const sf::ClientProcessId &client_process_id);
             /*-------------------------------------------------------------------------------*/
+            static const char* DisconnectReasonToString(u32 reason);
     };
     static_assert(ams::mitm::ldn::IsICommunicationInterface<ICommunicationService>);
 }

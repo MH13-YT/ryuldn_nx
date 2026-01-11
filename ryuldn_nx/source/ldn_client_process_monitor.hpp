@@ -23,16 +23,8 @@
 namespace ams::mitm::ldn {
     class IClientProcessMonitor {
         public:
-            IClientProcessMonitor() {
-                LogFormat("IClientProcessMonitor created");
-            };
-            
-            ~IClientProcessMonitor() {
-                LogFormat("~IClientProcessMonitor destroyed");
-            };
-            
             Result RegisterClient(const sf::ClientProcessId &client_process_id);
-    };
+        };
     
     static_assert(ams::mitm::ldn::IsIClientProcessMonitorInterface<IClientProcessMonitor>);
 }

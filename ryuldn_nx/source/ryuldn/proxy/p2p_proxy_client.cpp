@@ -17,14 +17,20 @@ namespace ams::mitm::ldn::ryuldn::proxy {
           _running(false),
           _connectedEvent(os::EventClearMode_ManualClear, true),
           _readyEvent(os::EventClearMode_ManualClear, true),
-          _stateMutex(false)
+          _stateMutex(false),
+          _packetBufferMutex(false)
     {
+        LOG_HEAP(COMP_RLDN_P2P_CLI, "P2pProxyClient constructor start");
         // Register protocol handler
         _protocol.onProxyConfig = [this](const LdnHeader& header, const ProxyConfig& config) {
             HandleProxyConfig(header, config);
         };
 
-        LogFormat("P2pProxyClient: Created for %s:%u", _address.c_str(), _port);
+        // Allocate shared packet buffer
+        _packetBuffer = std::make_unique<u8[]>(MaxPacketSize);
+
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Created for %s:%u", _address.c_str(), _port);
+        LOG_HEAP(COMP_RLDN_P2P_CLI, "P2pProxyClient constructor end");
     }
 
     P2pProxyClient::~P2pProxyClient() {
@@ -39,7 +45,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Create socket
         _socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (_socket < 0) {
-            LogFormat("P2pProxyClient: Failed to create socket");
+            LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to create socket");
             return false;
         }
 
@@ -54,14 +60,14 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         serverAddr.sin_port = htons(_port);
 
         if (inet_pton(AF_INET, _address.c_str(), &serverAddr.sin_addr) <= 0) {
-            LogFormat("P2pProxyClient: Invalid address %s", _address.c_str());
+            LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Invalid address %s", _address.c_str());
             close(_socket);
             _socket = -1;
             return false;
         }
 
         if (connect(_socket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) < 0) {
-            LogFormat("P2pProxyClient: Failed to connect to %s:%u (errno=%d)", _address.c_str(), _port, errno);
+            LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to connect to %s:%u (errno=%d)", _address.c_str(), _port, errno);
             close(_socket);
             _socket = -1;
             return false;
@@ -74,7 +80,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Create receive thread
         Result rc = os::CreateThread(&_receiveThread, ReceiveThreadFunc, this, stackTop, ThreadStackSize, 0x2C, 3);
         if (R_FAILED(rc)) {
-            LogFormat("P2pProxyClient: Failed to create receive thread: 0x%x", rc);
+            LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to create receive thread: 0x%x", rc);
             close(_socket);
             _socket = -1;
             return false;
@@ -85,7 +91,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         os::SignalSystemEvent(_connectedEvent.GetBase());
         os::StartThread(&_receiveThread);
 
-        LogFormat("P2pProxyClient: Connected to %s:%u", _address.c_str(), _port);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Connected to %s:%u", _address.c_str(), _port);
         return true;
     }
 
@@ -118,7 +124,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _socket = -1;
         }
 
-        LogFormat("P2pProxyClient: Disconnected");
+        LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Disconnected");
     }
 
     void P2pProxyClient::ReceiveThreadFunc(void* arg) {
@@ -135,11 +141,11 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             if (received > 0) {
                 _protocol.Read(buffer, 0, received);
             } else if (received == 0) {
-                LogFormat("P2pProxyClient: Server disconnected");
+                LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Server disconnected");
                 break;
             } else {
                 if (errno != EINTR) {
-                    LogFormat("P2pProxyClient: Receive error: %d", errno);
+                    LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Receive error: %d", errno);
                     break;
                 }
             }
@@ -161,7 +167,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         _ready = true;
         os::SignalSystemEvent(_readyEvent.GetBase());
 
-        LogFormat("P2pProxyClient: Received proxy config - IP=0x%08x, Mask=0x%08x",
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Received proxy config - IP=0x%08x, Mask=0x%08x",
                  config.proxyIp, config.proxySubnetMask);
 
         // TODO: Register proxy with socket helpers (requires integration with BSD socket layer)
@@ -172,32 +178,33 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Wait for connection
         TimeSpan timeout = TimeSpan::FromMilliSeconds(FailureTimeoutMs);
         if (!os::TimedWaitSystemEvent(_connectedEvent.GetBase(), timeout)) {
-            LogFormat("P2pProxyClient: Connection timeout");
+            LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Connection timeout");
             return false;
         }
 
         if (!_connected) {
-            LogFormat("P2pProxyClient: Not connected");
+            LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Not connected");
             return false;
         }
 
         // Send authentication
-        u8 packet[MaxPacketSize];
+        std::scoped_lock lock(_packetBufferMutex);
+        u8* packet = _packetBuffer.get();
         int packetSize = RyuLdnProtocol::Encode(PacketId::ExternalProxy, config, packet);
 
         if (!SendAsync(packet, packetSize)) {
-            LogFormat("P2pProxyClient: Failed to send authentication");
+            LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to send authentication");
             return false;
         }
 
-        LogFormat("P2pProxyClient: Authentication sent");
+        LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Authentication sent");
         return true;
     }
 
     bool P2pProxyClient::EnsureProxyReady() {
         TimeSpan timeout = TimeSpan::FromMilliSeconds(FailureTimeoutMs);
         if (!os::TimedWaitSystemEvent(_readyEvent.GetBase(), timeout)) {
-            LogFormat("P2pProxyClient: Proxy ready timeout");
+            LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Proxy ready timeout");
             return false;
         }
 
@@ -211,7 +218,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         ssize_t sent = send(_socket, data, size, 0);
         if (sent != static_cast<ssize_t>(size)) {
-            LogFormat("P2pProxyClient: Send failed (sent=%ld, expected=%zu)", sent, size);
+            LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Send failed (sent=%ld, expected=%zu)", sent, size);
             return false;
         }
 

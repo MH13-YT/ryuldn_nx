@@ -1,1078 +1,745 @@
 #include "ldn_master_proxy_client.hpp"
 #include "../debug.hpp"
+
+
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
 #include <cstring>
+#include <algorithm>
+#include <netinet/tcp.h>
 
 namespace ams::mitm::ldn::ryuldn {
 
-    LdnMasterProxyClient::LdnMasterProxyClient(const char* serverAddress, int serverPort, bool useP2pProxy)
-        : _serverAddress(serverAddress),
-          _serverPort(serverPort),
-          _socket(-1),
-          _connected(false),
-          _networkConnected(false),
-          _stop(false),
-          _useP2pProxy(useP2pProxy),
-          _connectedEvent(nullptr),
-          _errorEvent(nullptr),
-          _scanEvent(nullptr),
-          _rejectEvent(nullptr),
-          _apConnectedEvent(nullptr),
-          _disconnectReason(DisconnectReason::None),
-          _lastError(NetworkError::None),
-          _config{0, 0},
-          _hostedProxy(nullptr),
-          _connectedProxy(nullptr)
-    {
-        LogInfo("========================================");
-        LogInfo("=== LdnMasterProxyClient Constructor ===");
-        LogInfo("Server: %s:%d", serverAddress, serverPort);
-        LogInfo("UseP2pProxy: %s", useP2pProxy ? "YES" : "NO");
+LdnMasterProxyClient::LdnMasterProxyClient(const char* serverAddress, int serverPort, bool useP2pProxy)
+    : _serverAddress(serverAddress), 
+      _serverPort(serverPort), 
+      _useP2pProxy(useP2pProxy),
+      _packetBufferMutex(false) 
+{
 
-        LogDebug("Initializing memory structures");
-        std::memset(&_initializeMemory, 0, sizeof(_initializeMemory));
-        std::memset(_gameVersion, 0, sizeof(_gameVersion));
+    _socket = -1;
+    _connected = false;
+    _networkConnected = false;
+    _stop = false;
+    _hostedProxy = nullptr;
+    _connectedProxy = nullptr;
+    _disconnectReason = DisconnectReason::None;
+    _lastError = NetworkError::None;
 
-        LogDebug("About to allocate thread stack (size=0x%zx + alignment=0x%zx, total=0x%zx)",
-                 ThreadStackSize, os::ThreadStackAlignment, ThreadStackSize + os::ThreadStackAlignment);
+    _threadStack = std::make_unique<u8[]>(ThreadStackSize + os::ThreadStackAlignment);
+    _packetBuffer = std::make_unique<u8[]>(MaxPacketSize);
 
-        _threadStack = std::make_unique<u8[]>(ThreadStackSize + os::ThreadStackAlignment);
+    // Allocate SystemEvent objects using operator new (which uses our custom heap)
+    // We allocate raw memory first, then use placement new to construct
+    _connectedEvent = static_cast<os::SystemEvent*>(::operator new(sizeof(os::SystemEvent), std::nothrow));
+    _errorEvent     = static_cast<os::SystemEvent*>(::operator new(sizeof(os::SystemEvent), std::nothrow));
+    _scanEvent      = static_cast<os::SystemEvent*>(::operator new(sizeof(os::SystemEvent), std::nothrow));
+    _rejectEvent    = static_cast<os::SystemEvent*>(::operator new(sizeof(os::SystemEvent), std::nothrow));
+    _apConnectedEvent = static_cast<os::SystemEvent*>(::operator new(sizeof(os::SystemEvent), std::nothrow));
 
-        if (!_threadStack) {
-            LogError("CRITICAL: Failed to allocate thread stack!");
-        } else {
-            LogDebug("Thread stack allocated successfully at %p", _threadStack.get());
-        }
+    // Verify allocations succeeded
+    if (!_connectedEvent || !_errorEvent || !_scanEvent || !_rejectEvent || !_apConnectedEvent) {
+        // Clean up any successful allocations
+        if (_connectedEvent) ::operator delete(_connectedEvent);
+        if (_errorEvent) ::operator delete(_errorEvent);
+        if (_scanEvent) ::operator delete(_scanEvent);
+        if (_rejectEvent) ::operator delete(_rejectEvent);
+        if (_apConnectedEvent) ::operator delete(_apConnectedEvent);
 
-        LogDebug("Allocating SystemEvents");
-        _connectedEvent = new os::SystemEvent(os::EventClearMode_ManualClear, false);
-        LogDebug("_connectedEvent created");
-        _errorEvent = new os::SystemEvent(os::EventClearMode_ManualClear, false);
-        LogDebug("_errorEvent created");
-        _scanEvent = new os::SystemEvent(os::EventClearMode_ManualClear, false);
-        LogDebug("_scanEvent created");
-        _rejectEvent = new os::SystemEvent(os::EventClearMode_ManualClear, false);
-        LogDebug("_rejectEvent created");
-        _apConnectedEvent = new os::SystemEvent(os::EventClearMode_AutoClear, false);
-        LogDebug("_apConnectedEvent created");
-
-        LogDebug("Registering protocol callbacks (11 callbacks total)");
-        // Setup protocol callbacks
-        _protocol.onInitialize = [this](const LdnHeader& h, const InitializeMessage& m) { HandleInitialize(h, m); };
-        _protocol.onConnected = [this](const LdnHeader& h, const NetworkInfo& i) { HandleConnected(h, i); };
-        _protocol.onSyncNetwork = [this](const LdnHeader& h, const NetworkInfo& i) { HandleSyncNetwork(h, i); };
-        _protocol.onDisconnected = [this](const LdnHeader& h, const DisconnectMessage& m) { HandleDisconnected(h, m); };
-        _protocol.onRejectReply = [this](const LdnHeader& h) { HandleRejectReply(h); };
-        _protocol.onScanReply = [this](const LdnHeader& h, const NetworkInfo& i) { HandleScanReply(h, i); };
-        _protocol.onScanReplyEnd = [this](const LdnHeader& h) { HandleScanReplyEnd(h); };
-        _protocol.onProxyConfig = [this](const LdnHeader& h, const ProxyConfig& c) { HandleProxyConfig(h, c); };
-        _protocol.onProxyData = [this](const LdnHeader& h, const ProxyDataHeaderFull& hdr, const u8* p, u32 s) { HandleProxyData(h, hdr, p, s); };
-        _protocol.onPing = [this](const LdnHeader& h, const PingMessage& p) { HandlePing(h, p); };
-        _protocol.onNetworkError = [this](const LdnHeader& h, const NetworkErrorMessage& e) { HandleNetworkError(h, e); };
-        _protocol.onExternalProxy = [this](const LdnHeader& h, const ExternalProxyConfig& c) { HandleExternalProxy(h, c); };
-
-        LogInfo("LdnMasterProxyClient created successfully");
-        LogInfo("========================================");
+        _connectedEvent = _errorEvent = _scanEvent = _rejectEvent = _apConnectedEvent = nullptr;
+        AMS_ABORT("Failed to allocate SystemEvent objects");
     }
 
-    LdnMasterProxyClient::~LdnMasterProxyClient() {
-        LogInfo("LdnMasterProxyClient destructor called");
-        (void)Finalize();
+    // Initialize SystemEvents using placement new
+    new (_connectedEvent) os::SystemEvent(os::EventClearMode_ManualClear, false);
+    new (_errorEvent) os::SystemEvent(os::EventClearMode_ManualClear, false);
+    new (_scanEvent) os::SystemEvent(os::EventClearMode_ManualClear, false);
+    new (_rejectEvent) os::SystemEvent(os::EventClearMode_ManualClear, false);
+    new (_apConnectedEvent) os::SystemEvent(os::EventClearMode_AutoClear, false);
 
-        // Delete SystemEvents
-        if (_connectedEvent) delete _connectedEvent;
-        if (_errorEvent) delete _errorEvent;
-        if (_scanEvent) delete _scanEvent;
-        if (_rejectEvent) delete _rejectEvent;
-        if (_apConnectedEvent) delete _apConnectedEvent;
+    // Initialize to all zeros (server will assign ID and MAC in response)
+    // This matches Ryujinx behavior - see InitializeMessage.cs comments:
+    // "All 0 if we don't have an ID yet" and "All 0 if we don't have a mac yet"
+    std::memset(&_initializeMemory, 0, sizeof(_initializeMemory));
+    std::memset(_gameVersion, 0, sizeof(_gameVersion));
 
-        LogInfo("LdnMasterProxyClient destroyed");
+    _protocol.onInitialize = [this](const LdnHeader& h, const InitializeMessage& m) { HandleInitialize(h, m); };
+    _protocol.onConnected = [this](const LdnHeader& h, const NetworkInfo& i) { HandleConnected(h, i); };
+    _protocol.onSyncNetwork = [this](const LdnHeader& h, const NetworkInfo& i) { HandleSyncNetwork(h, i); };
+    _protocol.onDisconnected = [this](const LdnHeader& h, const DisconnectMessage& m) { HandleDisconnected(h, m); };
+    _protocol.onRejectReply = [this](const LdnHeader& h) { HandleRejectReply(h); };
+    _protocol.onScanReply = [this](const LdnHeader& h, const NetworkInfo& i) { HandleScanReply(h, i); };
+    _protocol.onScanReplyEnd = [this](const LdnHeader& h) { HandleScanReplyEnd(h); };
+    _protocol.onProxyConfig = [this](const LdnHeader& h, const ProxyConfig& c) { HandleProxyConfig(h, c); };
+    _protocol.onProxyData = [this](const LdnHeader& h, const ProxyDataHeaderFull& hdr, const u8* p, u32 s) { 
+        HandleProxyData(h, hdr, p, s); 
+    };
+    _protocol.onPing = [this](const LdnHeader& h, const PingMessage& p) { HandlePing(h, p); };
+    _protocol.onNetworkError = [this](const LdnHeader& h, const NetworkErrorMessage& e) { HandleNetworkError(h, e); };
+    _protocol.onExternalProxy = [this](const LdnHeader& h, const ExternalProxyConfig& c) { HandleExternalProxy(h, c); };
+}
+
+LdnMasterProxyClient::~LdnMasterProxyClient() {
+    static_cast<void>(Finalize());
+
+    // Manually destroy and deallocate SystemEvents
+    if (_connectedEvent) {
+        _connectedEvent->~SystemEvent();
+        ::operator delete(_connectedEvent);
+    }
+    if (_errorEvent) {
+        _errorEvent->~SystemEvent();
+        ::operator delete(_errorEvent);
+    }
+    if (_scanEvent) {
+        _scanEvent->~SystemEvent();
+        ::operator delete(_scanEvent);
+    }
+    if (_rejectEvent) {
+        _rejectEvent->~SystemEvent();
+        ::operator delete(_rejectEvent);
+    }
+    if (_apConnectedEvent) {
+        _apConnectedEvent->~SystemEvent();
+        ::operator delete(_apConnectedEvent);
     }
 
-    Result LdnMasterProxyClient::Initialize() {
-        LogFunctionEntry();
-        LogInfo("Initializing LdnMasterProxyClient");
+    if (_hostedProxy) delete _hostedProxy;
+    if (_connectedProxy) delete _connectedProxy;
+}
 
-        if (_stop) {
-            LogWarning("Initialize called but _stop flag is set!");
-        }
+Result LdnMasterProxyClient::Initialize() {
+    if (!_packetBuffer || !_threadStack) return MAKERESULT(0xFD, 1);
+    
+    // Initialize timeout handler
+    _timeout = std::make_unique<NetworkTimeout>(InactiveTimeout, [this]() {
+        this->TimeoutConnection();
+    });
+    
+    uintptr_t stackAddr = reinterpret_cast<uintptr_t>(_threadStack.get());
+    uintptr_t alignedAddr = util::AlignUp(stackAddr, os::ThreadStackAlignment);
+    void* stackTop = reinterpret_cast<void*>(alignedAddr);
+    Result rc = os::CreateThread(&_workerThread, WorkerThreadFunc, this, stackTop, ThreadStackSize, 0x15, 2);
+    if (R_FAILED(rc)) return rc;
+    os::StartThread(&_workerThread);
+    return ResultSuccess();
+}
 
-        // Create worker thread
-        uintptr_t stackAddr = reinterpret_cast<uintptr_t>(_threadStack.get());
-        uintptr_t alignedAddr = util::AlignUp(stackAddr, os::ThreadStackAlignment);
-        void* stackTop = reinterpret_cast<void*>(alignedAddr);
-
-        LogDebug("Thread stack: raw=%p aligned=%p (offset=%zu)",
-                 (void*)stackAddr, stackTop, alignedAddr - stackAddr);
-        LogDebug("Creating worker thread: priority=0x15 (21), ideal_core=2");
-
-        Result rc = os::CreateThread(&_workerThread, WorkerThreadFunc, this, stackTop, ThreadStackSize, 0x15, 2);
-        if (R_FAILED(rc)) {
-            LogError("CRITICAL: Failed to create worker thread: rc=0x%x", rc.GetValue());
-            return rc;
-        }
-
-        LogThreadCreate("LdnMasterProxy::Worker", 0x15);
-        os::StartThread(&_workerThread);
-        LogThreadStart("LdnMasterProxy::Worker");
-
-        LogInfo("LdnMasterProxyClient initialized successfully");
-        LogFunctionExit();
-        return ResultSuccess();
+Result LdnMasterProxyClient::Finalize() {
+    if (_stop) return ResultSuccess();
+    _stop = true;
+    if (_socket >= 0) Disconnect();
+    
+    // Cleanup timeout
+    if (_timeout) {
+        _timeout->Dispose();
+        _timeout.reset();
     }
+    
+    os::WaitThread(&_workerThread);
+    os::DestroyThread(&_workerThread);
+    return ResultSuccess();
+}
 
-    Result LdnMasterProxyClient::Finalize() {
-        LogFunctionEntry();
-        LogInfo("Finalizing LdnMasterProxyClient");
+void LdnMasterProxyClient::WorkerThreadFunc(void* arg) {
+    LdnMasterProxyClient* client = static_cast<LdnMasterProxyClient*>(arg);
+    if (client) client->WorkerLoop();
+}
 
-        if (_stop) {
-            LogWarning("Finalize called but already stopped");
-            return ResultSuccess();
-        }
-
-        LogInfo("Setting stop flag");
-        _stop = true;
-
-        if (_socket >= 0) {
-            LogInfo("Disconnecting active connection (socket=%d)", _socket);
+void LdnMasterProxyClient::WorkerLoop() {
+    while (!_stop) {
+        if (_connected && ReceiveData() < 0) {
             Disconnect();
-        } else {
-            LogDebug("No active socket to disconnect");
-        }
-
-        LogInfo("Waiting for worker thread to terminate");
-        os::WaitThread(&_workerThread);
-        LogThreadExit("LdnMasterProxy::Worker");
-
-        LogDebug("Destroying worker thread");
-        os::DestroyThread(&_workerThread);
-
-        LogInfo("LdnMasterProxyClient finalized successfully");
-        LogFunctionExit();
-        return ResultSuccess();
-    }
-
-    void LdnMasterProxyClient::WorkerThreadFunc(void* arg) {
-        LogTrace("WorkerThreadFunc entry: arg=%p", arg);
-        LdnMasterProxyClient* client = static_cast<LdnMasterProxyClient*>(arg);
-        if (!client) {
-            LogError("FATAL: WorkerThreadFunc received null client pointer!");
-            return;
-        }
-        client->WorkerLoop();
-        LogTrace("WorkerThreadFunc exit");
-    }
-
-    void LdnMasterProxyClient::WorkerLoop() {
-        LogInfo("=== Worker thread started ===");
-        LogDebug("Worker loop polling every 10ms");
-
-        int iteration = 0;
-        int errors_in_a_row = 0;
-
-        while (!_stop) {
-            if (_connected) {
-                int rc = ReceiveData();
-                if (rc < 0) {
-                    errors_in_a_row++;
-                    LogError("Receive error on iteration %d (errors_in_a_row=%d)", iteration, errors_in_a_row);
-                    LogInfo("Disconnecting due to receive error");
-                    Disconnect();
-                    LogEventSignal("_errorEvent");
-                    _errorEvent->Signal();
-                } else if (rc > 0) {
-                    // Reset error counter on successful receive
-                    if (errors_in_a_row > 0) {
-                        LogDebug("Recovered from errors (had %d errors)", errors_in_a_row);
-                        errors_in_a_row = 0;
-                    }
-                }
-                // rc == 0 means no data (EWOULDBLOCK), which is normal
-            } else {
-                // Log periodically when not connected
-                if ((iteration % 1000) == 0) {  // Every ~10 seconds
-                    LogTrace("Worker loop iteration %d: not connected", iteration);
-                }
-            }
-
-            os::SleepThread(TimeSpan::FromMilliSeconds(10));
-            iteration++;
-
-            // Periodic health check log
-            if ((iteration % 6000) == 0) {  // Every ~60 seconds
-                LogDebug("Worker loop health check: iteration=%d connected=%d networkConnected=%d",
-                         iteration, _connected ? 1 : 0, _networkConnected ? 1 : 0);
-            }
-        }
-
-        LogInfo("=== Worker thread stopping (stop flag set) ===");
-        LogInfo("Worker thread final stats: iterations=%d, connected=%d", iteration, _connected ? 1 : 0);
-    }
-
-    bool LdnMasterProxyClient::EnsureConnected() {
-        if (_connected) {
-            LogTrace("EnsureConnected: already connected");
-            return true;
-        }
-
-        LogInfo("========================================");
-        LogInfo("=== Establishing Connection to Master Server ===");
-        LogInfo("Target: %s:%d", _serverAddress.c_str(), _serverPort);
-
-        LogDebug("Clearing error and connected events");
-        _errorEvent->Clear();
-        _connectedEvent->Clear();
-
-        // Create socket
-        LogDebug("Creating TCP socket (AF_INET, SOCK_STREAM)");
-        _socket = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (_socket < 0) {
-            LogError("CRITICAL: Failed to create socket: errno=%d (%s)", errno, strerror(errno));
-            LogEventSignal("_errorEvent");
             _errorEvent->Signal();
-            return false;
         }
-        LogNetSocket(_socket, AF_INET, SOCK_STREAM, 0);
-        LogInfo("Socket created successfully: fd=%d", _socket);
-
-        // Set non-blocking
-        LogDebug("Setting socket to non-blocking mode");
-        int flags = fcntl(_socket, F_GETFL, 0);
-        if (flags < 0) {
-            LogWarning("fcntl F_GETFL failed: errno=%d", errno);
+        
+        // Check for timeouts periodically
+        if (_timeout) {
+            _timeout->CheckTimeout();
         }
-        int rc = fcntl(_socket, F_SETFL, flags | O_NONBLOCK);
-        if (rc < 0) {
-            LogError("fcntl F_SETFL failed: errno=%d", errno);
-        } else {
-            LogDebug("Socket set to non-blocking mode");
-        }
-
-        // Resolve hostname
-        LogInfo("Resolving hostname: %s", _serverAddress.c_str());
-        struct addrinfo hints, *result;
-        std::memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char portStr[16];
-        snprintf(portStr, sizeof(portStr), "%d", _serverPort);
-
-        int gai_rc = getaddrinfo(_serverAddress.c_str(), portStr, &hints, &result);
-        if (gai_rc != 0) {
-            LogError("CRITICAL: Failed to resolve hostname '%s': error=%d (%s)",
-                     _serverAddress.c_str(), gai_rc, gai_strerror(gai_rc));
-            LogNetClose(_socket);
-            close(_socket);
-            _socket = -1;
-            LogEventSignal("_errorEvent");
-            _errorEvent->Signal();
-            return false;
-        }
-
-        if (result && result->ai_addr) {
-            struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
-            LogInfo("Hostname resolved to: %s:%d",
-                    inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
-        }
-
-        // Connect
-        LogInfo("Initiating TCP connection (non-blocking)");
-        rc = ::connect(_socket, result->ai_addr, result->ai_addrlen);
-        int connect_errno = errno;
-        freeaddrinfo(result);
-
-        if (rc < 0 && connect_errno != EINPROGRESS) {
-            LogError("CRITICAL: connect() failed immediately: errno=%d (%s)",
-                     connect_errno, strerror(connect_errno));
-            LogNetClose(_socket);
-            close(_socket);
-            _socket = -1;
-            LogEventSignal("_errorEvent");
-            _errorEvent->Signal();
-            return false;
-        }
-
-        if (rc == 0) {
-            LogInfo("Connected immediately (rare for non-blocking socket)");
-        } else {
-            LogDebug("connect() returned EINPROGRESS, waiting for completion");
-        }
-
-        // Wait for connection with timeout
-        LogInfo("Polling for connection completion (timeout=%dms)", FailureTimeout);
-        struct pollfd pfd;
-        pfd.fd = _socket;
-        pfd.events = POLLOUT;
-        pfd.revents = 0;
-
-        rc = poll(&pfd, 1, FailureTimeout);
-        if (rc < 0) {
-            LogError("CRITICAL: poll() failed: errno=%d (%s)", errno, strerror(errno));
-            LogNetClose(_socket);
-            close(_socket);
-            _socket = -1;
-            LogEventSignal("_errorEvent");
-            _errorEvent->Signal();
-            return false;
-        } else if (rc == 0) {
-            LogError("CRITICAL: Connection timeout after %dms", FailureTimeout);
-            LogNetClose(_socket);
-            close(_socket);
-            _socket = -1;
-            LogEventSignal("_errorEvent");
-            _errorEvent->Signal();
-            return false;
-        }
-
-        LogDebug("poll() returned: revents=0x%x (POLLOUT=%d POLLERR=%d POLLHUP=%d)",
-                 pfd.revents, (pfd.revents & POLLOUT) != 0,
-                 (pfd.revents & POLLERR) != 0, (pfd.revents & POLLHUP) != 0);
-
-        // Check if connected successfully
-        LogDebug("Checking socket error status");
-        int error = 0;
-        socklen_t len = sizeof(error);
-        getsockopt(_socket, SOL_SOCKET, SO_ERROR, &error, &len);
-
-        if (error != 0) {
-            LogError("CRITICAL: Connection failed with socket error: %d (%s)", error, strerror(error));
-            LogNetClose(_socket);
-            close(_socket);
-            _socket = -1;
-            LogEventSignal("_errorEvent");
-            _errorEvent->Signal();
-            return false;
-        }
-
-        _connected = true;
-        LogStateChange("disconnected", "connected");
-        LogInfo("Protocol resetting");
-        _protocol.Reset();
-        LogEventSignal("_connectedEvent");
-        _connectedEvent->Signal();
-
-        LogInfo("✓ Connected to master server successfully");
-
-        // Send initialize packet
-        LogInfo("Sending Initialize packet");
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::Initialize, _initializeMemory, packet);
-        LogDebug("Initialize packet size: %d bytes", size);
-        int sent = SendPacket(packet, size);
-        if (sent < 0) {
-            LogError("Failed to send Initialize packet");
-        } else {
-            LogInfo("Initialize packet sent successfully (%d bytes)", sent);
-        }
-
-        if (_passphrase.length() > 0) {
-            LogDebug("Updating passphrase");
-            UpdatePassphraseIfNeeded(_passphrase.c_str());
-        }
-
-        LogInfo("========================================");
-        return true;
-    }
-
-    void LdnMasterProxyClient::Disconnect() {
-        LogFunctionEntry();
-        LogInfo("Disconnecting from master server");
-
-        if (_socket >= 0) {
-            LogInfo("Closing socket: fd=%d", _socket);
-            LogNetClose(_socket);
-            close(_socket);
-            _socket = -1;
-        } else {
-            LogDebug("No socket to close (already -1)");
-        }
-
-        if (_connected) {
-            _connected = false;
-            LogStateChange("connected", "disconnected");
-        }
-
-        if (_networkConnected) {
-            LogInfo("Network was connected, calling DisconnectInternal");
-            DisconnectInternal();
-        } else {
-            LogDebug("Network was not connected");
-        }
-
-        LogInfo("Disconnect complete");
-    }
-
-    void LdnMasterProxyClient::DisconnectInternal() {
-        LogFunctionEntry();
-        LogInfo("Internal network disconnect");
-
-        if (_networkConnected) {
-            _networkConnected = false;
-            LogStateChange("network_connected", "network_disconnected");
-
-            // Clean up P2P proxy resources
-            if (_hostedProxy) {
-                LogInfo("Disposing hosted proxy at %p", (void*)_hostedProxy);
-                _hostedProxy->Dispose();
-                LogMemFree(_hostedProxy);
-                delete _hostedProxy;
-                _hostedProxy = nullptr;
-            } else {
-                LogDebug("No hosted proxy to dispose");
-            }
-
-            if (_connectedProxy) {
-                LogInfo("Disconnecting connected proxy at %p", (void*)_connectedProxy);
-                _connectedProxy->Disconnect();
-                LogMemFree(_connectedProxy);
-                delete _connectedProxy;
-                _connectedProxy = nullptr;
-            } else {
-                LogDebug("No connected proxy to disconnect");
-            }
-
-            LogDebug("Clearing AP connected event");
-            os::ClearSystemEvent(_apConnectedEvent->GetBase());
-
-            if (_networkChangeCallback) {
-                LogInfo("Notifying network change callback (disconnected)");
-                NetworkInfo emptyInfo;
-                std::memset(&emptyInfo, 0, sizeof(emptyInfo));
-                _networkChangeCallback(emptyInfo, false);
-            } else {
-                LogDebug("No network change callback registered");
-            }
-        } else {
-            LogDebug("DisconnectInternal called but network was not connected");
-        }
-
-        LogInfo("Internal disconnect complete");
-    }
-
-    int LdnMasterProxyClient::SendPacket(const u8* data, int size) {
-        LogTrace("SendPacket: size=%d", size);
-
-        if (!_connected || _socket < 0) {
-            LogError("SendPacket: not connected (connected=%d socket=%d)", _connected ? 1 : 0, _socket);
-            return -1;
-        }
-
-        if (!data || size <= 0) {
-            LogError("SendPacket: invalid parameters (data=%p size=%d)", (void*)data, size);
-            return -1;
-        }
-
-        if (size > MaxPacketSize) {
-            LogError("SendPacket: size %d exceeds MaxPacketSize %d", size, MaxPacketSize);
-            return -1;
-        }
-
-        std::lock_guard<std::mutex> lock(_sendMutex);
-
-        int sent = 0;
-        int retry_count = 0;
-        constexpr int MaxRetries = 1000;  // ~1 second at 1ms per retry
-
-        while (sent < size) {
-            int rc = ::send(_socket, data + sent, size - sent, 0);
-            if (rc < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    retry_count++;
-                    if (retry_count > MaxRetries) {
-                        LogError("SendPacket: exceeded max retries (%d), aborting", MaxRetries);
-                        return -1;
-                    }
-                    if ((retry_count % 100) == 0) {
-                        LogWarning("SendPacket: socket blocking, retry %d/%d", retry_count, MaxRetries);
-                    }
-                    os::SleepThread(TimeSpan::FromMilliSeconds(1));
-                    continue;
-                }
-                LogError("SendPacket: send() error at offset %d/%d: errno=%d (%s)",
-                         sent, size, errno, strerror(errno));
-                LogNetError(_socket, errno, "send failed");
-                return -1;
-            }
-            sent += rc;
-            LogTrace("SendPacket: sent %d bytes (total %d/%d)", rc, sent, size);
-        }
-
-        if (retry_count > 0) {
-            LogDebug("SendPacket: completed after %d retries", retry_count);
-        }
-        LogNetSend(_socket, sent);
-        return sent;
-    }
-
-    int LdnMasterProxyClient::SendRawPacket(const u8* data, int size) {
-        LogTrace("SendRawPacket: forwarding to SendPacket, size=%d", size);
-        return SendPacket(data, size);
-    }
-
-    int LdnMasterProxyClient::ReceiveData() {
-        LogTrace("ReceiveData entry");
-
-        if (!_connected || _socket < 0) {
-            LogError("ReceiveData: not connected (connected=%d socket=%d)", _connected ? 1 : 0, _socket);
-            return -1;
-        }
-
-        u8 buffer[4096];
-        int received = ::recv(_socket, buffer, sizeof(buffer), MSG_DONTWAIT);
-
-        if (received < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No data available - this is normal
-                return 0;
-            }
-            LogError("ReceiveData: recv() error: errno=%d (%s)", errno, strerror(errno));
-            LogNetError(_socket, errno, "recv failed");
-            return -1;
-        }
-
-        if (received == 0) {
-            LogWarning("ReceiveData: Connection closed by server (recv returned 0)");
-            return -1;
-        }
-
-        LogNetRecv(_socket, received);
-        LogDebug("ReceiveData: received %d bytes, passing to protocol parser", received);
-
-        // Pass to protocol parser
-        _protocol.Read(buffer, 0, received);
-
-        return received;
-    }
-
-    void LdnMasterProxyClient::UpdatePassphraseIfNeeded(const char* passphrase) {
-        if (!passphrase || strlen(passphrase) == 0) {
-            return;
-        }
-
-        if (_passphrase == passphrase) {
-            return;
-        }
-
-        _passphrase = passphrase;
-
-        if (_connected) {
-            u8 packet[MaxPacketSize];
-            PassphraseMessage msg;
-            std::memset(&msg, 0, sizeof(msg));
-            strncpy(msg.passphrase, passphrase, sizeof(msg.passphrase) - 1);
-
-            int size = RyuLdnProtocol::Encode(PacketId::Passphrase, msg, packet);
-            SendPacket(packet, size);
-
-            LogFormat("Sent passphrase update");
-        }
-    }
-
-    void LdnMasterProxyClient::SetNetworkChangeCallback(NetworkChangeCallback callback) {
-        _networkChangeCallback = callback;
-    }
-
-    void LdnMasterProxyClient::SetProxyConfigCallback(ProxyConfigCallback callback) {
-        _proxyConfigCallback = callback;
-    }
-
-    void LdnMasterProxyClient::SetProxyDataCallback(ProxyDataCallback callback) {
-        _proxyDataCallback = callback;
-    }
-
-    void LdnMasterProxyClient::SetGameVersion(const u8* version, size_t size) {
-        size_t copySize = std::min(size, sizeof(_gameVersion));
-        std::memcpy(_gameVersion, version, copySize);
-    }
-
-    void LdnMasterProxyClient::SetPassphrase(const char* passphrase) {
-        UpdatePassphraseIfNeeded(passphrase);
-    }
-
-    // Protocol event handlers
-    void LdnMasterProxyClient::HandleInitialize([[maybe_unused]] const LdnHeader& header, const InitializeMessage& msg) {
-        LogFunctionEntry();
-        LogInfo("Received Initialize response from server");
-        _initializeMemory = msg;
-        LogDebug("Initialize memory updated");
-    }
-
-    void LdnMasterProxyClient::HandleConnected([[maybe_unused]] const LdnHeader& header, const NetworkInfo& info) {
-        LogFunctionEntry();
-        LogInfo("========================================");
-        LogInfo("=== NETWORK CONNECTED ===");
-        LogInfo("SSID: %.*s", (int)info.common.ssid.length, info.common.ssid.raw);
-        LogInfo("Channel: %d", info.common.channel);
-        LogInfo("Players: %d/%d", info.ldn.nodeCount, info.ldn.nodeCountMax);
-
-        _networkConnected = true;
-        LogStateChange("network_disconnected", "network_connected");
-
-        _disconnectReason = DisconnectReason::None;
-
-        LogEventSignal("_apConnectedEvent");
-        _apConnectedEvent->Signal();
-
-        if (_networkChangeCallback) {
-            LogDebug("Calling network change callback (connected=true)");
-            _networkChangeCallback(info, true);
-        } else {
-            LogWarning("No network change callback registered!");
-        }
-
-        LogInfo("========================================");
-    }
-
-    void LdnMasterProxyClient::HandleSyncNetwork([[maybe_unused]] const LdnHeader& header, const NetworkInfo& info) {
-        LogFunctionEntry();
-        LogInfo("Network sync - players: %d/%d", info.ldn.nodeCount, info.ldn.nodeCountMax);
-
-        if (_networkChangeCallback) {
-            LogDebug("Calling network change callback for sync");
-            _networkChangeCallback(info, true);
-        } else {
-            LogWarning("No network change callback for sync!");
-        }
-    }
-
-    void LdnMasterProxyClient::HandleDisconnected([[maybe_unused]] const LdnHeader& header, [[maybe_unused]] const DisconnectMessage& msg) {
-        LogFunctionEntry();
-        LogWarning("========================================");
-        LogWarning("=== NETWORK DISCONNECTED ===");
-        LogWarning("Reason code: %d", (int)msg.reason);
-        LogWarning("========================================");
-        DisconnectInternal();
-    }
-
-    void LdnMasterProxyClient::HandleRejectReply([[maybe_unused]] const LdnHeader& header) {
-        LogFunctionEntry();
-        LogWarning("Connection/action was REJECTED by server");
-        LogEventSignal("_rejectEvent");
-        _rejectEvent->Signal();
-    }
-
-    void LdnMasterProxyClient::HandleScanReply([[maybe_unused]] const LdnHeader& header, const NetworkInfo& info) {
-        LogTrace("HandleScanReply: adding network to available games");
-        LogDebug("Scan result: SSID='%.*s' players=%d/%d",
-                 (int)info.common.ssid.length, info.common.ssid.raw,
-                 info.ldn.nodeCount, info.ldn.nodeCountMax);
-        _availableGames.push_back(info);
-    }
-
-    void LdnMasterProxyClient::HandleScanReplyEnd([[maybe_unused]] const LdnHeader& header) {
-        LogFunctionEntry();
-        LogInfo("Scan complete: found %zu networks", _availableGames.size());
-        LogEventSignal("_scanEvent");
-        _scanEvent->Signal();
-    }
-
-    void LdnMasterProxyClient::HandleProxyConfig([[maybe_unused]] const LdnHeader& header, const ProxyConfig& config) {
-        LogFunctionEntry();
-        LogInfo("Received ProxyConfig: proxyIp=0x%08x proxySubnetMask=0x%08x",
-                config.proxyIp, config.proxySubnetMask);
-        _config = config;
-        LogFormat("Received proxy config: IP=0x%08x, Mask=0x%08x", config.proxyIp, config.proxySubnetMask);
-
-        // Notify callback
-        if (_proxyConfigCallback) {
-            _proxyConfigCallback(header, config);
-        }
-    }
-
-    void LdnMasterProxyClient::HandleProxyData([[maybe_unused]] const LdnHeader& header, const ProxyDataHeaderFull& hdr, const u8* payload, u32 payloadSize) {
-        // Forward to proxy via callback
-        if (_proxyDataCallback) {
-            _proxyDataCallback(header, hdr, payload, payloadSize);
-        }
-    }
-
-    void LdnMasterProxyClient::HandlePing([[maybe_unused]] const LdnHeader& header, const PingMessage& ping) {
-        if (ping.requester == 0) {
-            // Server requested ping, send it back
-            u8 packet[MaxPacketSize];
-            int size = RyuLdnProtocol::Encode(PacketId::Ping, ping, packet);
-            SendPacket(packet, size);
-        }
-    }
-
-    void LdnMasterProxyClient::HandleNetworkError([[maybe_unused]] const LdnHeader& header, const NetworkErrorMessage& error) {
-        if (error.error == NetworkError::PortUnreachable) {
-            // Disable P2P proxy if we get port unreachable error
-            _useP2pProxy = false;
-            LogFormat("Network error: PortUnreachable - P2P proxy disabled");
-        } else {
-            _lastError = error.error;
-            LogFormat("Network error: %d", static_cast<int>(error.error));
-        }
-    }
-
-    void LdnMasterProxyClient::HandleExternalProxy([[maybe_unused]] const LdnHeader& header, const ExternalProxyConfig& config) {
-        LogFormat("Received external proxy config - creating P2P proxy client");
-
-        // Convert proxy IP bytes to string
-        char ipStr[INET_ADDRSTRLEN];
-        u32 ipv4 = 0;
-
-        // Extract IPv4 address from config (last 4 bytes of IPv6-mapped address)
-        if (config.addressFamily == AF_INET) {
-            std::memcpy(&ipv4, config.proxyIp + 12, 4);
-            struct in_addr addr;
-            addr.s_addr = ipv4;
-            inet_ntop(AF_INET, &addr, ipStr, sizeof(ipStr));
-        } else {
-            LogFormat("HandleExternalProxy: Unsupported address family %d", config.addressFamily);
-            DisconnectInternal();
-            return;
-        }
-
-        // Create P2P proxy client
-        proxy::P2pProxyClient* client = new proxy::P2pProxyClient(ipStr, config.proxyPort);
-        _connectedProxy = client;
-
-        // Connect and authenticate
-        if (!client->Connect()) {
-            LogFormat("HandleExternalProxy: Failed to connect to proxy");
-            delete client;
-            _connectedProxy = nullptr;
-            DisconnectInternal();
-            return;
-        }
-
-        if (!client->PerformAuth(config)) {
-            LogFormat("HandleExternalProxy: Failed to authenticate");
-            delete client;
-            _connectedProxy = nullptr;
-            DisconnectInternal();
-            return;
-        }
-
-        LogFormat("HandleExternalProxy: Successfully connected to P2P proxy at %s:%u", ipStr, config.proxyPort);
-    }
-
-    NetworkError LdnMasterProxyClient::ConsumeNetworkError() {
-        NetworkError result = _lastError;
-        _lastError = NetworkError::None;
-        return result;
-    }
-
-    // LDN Operations
-    Result LdnMasterProxyClient::CreateNetwork(const CreateAccessPointRequest& request, const u8* advertiseData, u16 advertiseDataSize) {
-        LogFormat("CreateNetwork");
-
-        if (!EnsureConnected()) {
-            return MAKERESULT(0xFD, 1);
-        }
-
-        UpdatePassphraseIfNeeded(_passphrase.c_str());
-
-        // Clean up any existing hosted proxy
-        if (_hostedProxy) {
-            _hostedProxy->Dispose();
-            delete _hostedProxy;
-            _hostedProxy = nullptr;
-        }
-
-        // Try to create P2P proxy server if enabled
-        u16 internalProxyPort = 0;
-        u16 externalProxyPort = 0;
-        bool openSuccess = false;
-
-        if (_useP2pProxy) {
-            // Try to create proxy server on available port
-            for (s32 i = 0; i < proxy::P2pProxyServer::PrivatePortRange; i++) {
-                u16 port = proxy::P2pProxyServer::PrivatePortBase + i;
-                _hostedProxy = new proxy::P2pProxyServer(this, port, &_protocol);
-
-                if (_hostedProxy->Start()) {
-                    // Successfully started
-                    openSuccess = true;
-                    internalProxyPort = port;
-
-                    // Try UPnP port mapping
-                    externalProxyPort = _hostedProxy->NatPunch();
-
-                    if (externalProxyPort == 0) {
-                        // UPnP failed, but we can still use internal port
-                        LogFormat("CreateNetwork: UPnP NAT punch failed, using internal port only");
-                        externalProxyPort = internalProxyPort;
-                    } else {
-                        LogFormat("CreateNetwork: UPnP NAT punch success %u -> %u", internalProxyPort, externalProxyPort);
-                    }
-
-                    break;
-                } else {
-                    // Port unavailable, try next
-                    delete _hostedProxy;
-                    _hostedProxy = nullptr;
-                }
-            }
-
-            if (!openSuccess) {
-                LogFormat("CreateNetwork: Failed to open P2P proxy server");
-                _useP2pProxy = false;
-            }
-        }
-
-        // Copy game version into request
-        CreateAccessPointRequest modifiedRequest = request;
-        std::memcpy(modifiedRequest.ryuNetworkConfig.gameVersion, _gameVersion, sizeof(_gameVersion));
-
-        // Set proxy ports if available
-        if (openSuccess && _useP2pProxy) {
-            modifiedRequest.ryuNetworkConfig.internalProxyPort = internalProxyPort;
-            modifiedRequest.ryuNetworkConfig.externalProxyPort = externalProxyPort;
-        }
-
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::CreateAccessPoint, modifiedRequest, advertiseData, advertiseDataSize, packet);
-        SendPacket(packet, size);
-
-        // Send immediate dummy network change to avoid game crashes
-        if (_networkChangeCallback) {
-            NetworkInfo dummyInfo;
-            std::memset(&dummyInfo, 0, sizeof(dummyInfo));
-            std::memcpy(dummyInfo.common.bssid.raw, _initializeMemory.macAddress, 6);
-            dummyInfo.common.channel = request.networkConfig.channel;
-            dummyInfo.common.linkLevel = 3;
-            dummyInfo.common.networkType = 2;
-            dummyInfo.ldn.advertiseDataSize = advertiseDataSize;
-            dummyInfo.ldn.nodeCount = 1;
-            dummyInfo.ldn.nodeCountMax = request.networkConfig.nodeCountMax;
-            dummyInfo.ldn.securityMode = request.securityConfig.securityMode;
-            dummyInfo.ldn.nodes[0].ipv4Address = 0x0a730b01;  // Dummy IP
-            std::memcpy(dummyInfo.ldn.nodes[0].macAddress.raw, _initializeMemory.macAddress, 6);
-            dummyInfo.ldn.nodes[0].isConnected = 1;
-            dummyInfo.ldn.nodes[0].nodeId = 0;
-            dummyInfo.ldn.nodes[0].localCommunicationVersion = request.networkConfig.localCommunicationVersion;
-
-            _networkChangeCallback(dummyInfo, true);
-        }
-
-        // Wait for actual connection
-        bool signalled = _apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout));
-
-        if (signalled) {
-            return ResultSuccess();
-        } else {
-            return MAKERESULT(0xFD, 2);
-        }
-    }
-
-    Result LdnMasterProxyClient::CreateNetworkPrivate(const CreateAccessPointPrivateRequest& request, const u8* advertiseData, u16 advertiseDataSize) {
-        LogFormat("CreateNetworkPrivate");
-
-        if (!EnsureConnected()) {
-            return MAKERESULT(0xFD, 1);
-        }
-
-        UpdatePassphraseIfNeeded(_passphrase.c_str());
-
-        CreateAccessPointPrivateRequest modifiedRequest = request;
-        std::memcpy(modifiedRequest.ryuNetworkConfig.gameVersion, _gameVersion, sizeof(_gameVersion));
-
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::CreateAccessPointPrivate, modifiedRequest, advertiseData, advertiseDataSize, packet);
-        SendPacket(packet, size);
-
-        bool signalled = _apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout));
-
-        if (signalled) {
-            return ResultSuccess();
-        } else {
-            return MAKERESULT(0xFD, 2);
-        }
-    }
-
-    Result LdnMasterProxyClient::Connect(const ConnectRequest& request) {
-        LogFormat("Connect");
-
-        if (!EnsureConnected()) {
-            return MAKERESULT(0xFD, 1);
-        }
-
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::Connect, request, packet);
-        SendPacket(packet, size);
-
-        // Send immediate dummy network change
-        if (_networkChangeCallback) {
-            _networkChangeCallback(request.networkInfo, true);
-        }
-
-        bool signalled = _apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout));
-
-        // Wait for proxy to be ready if we're using P2P proxy client
-        if (signalled && _connectedProxy) {
-            if (!_connectedProxy->EnsureProxyReady()) {
-                LogFormat("Connect: P2P proxy not ready");
-                return MAKERESULT(0xFD, 3);
-            }
-            _config = _connectedProxy->GetProxyConfig();
-        }
-
-        NetworkError error = ConsumeNetworkError();
-        if (error != NetworkError::None) {
-            return MAKERESULT(0xFD, static_cast<int>(error));
-        }
-
-        if (signalled) {
-            return ResultSuccess();
-        } else {
-            return MAKERESULT(0xFD, static_cast<int>(NetworkError::ConnectTimeout));
-        }
-    }
-
-    Result LdnMasterProxyClient::ConnectPrivate(const ConnectPrivateRequest& request) {
-        LogFormat("ConnectPrivate");
-
-        if (!EnsureConnected()) {
-            return MAKERESULT(0xFD, 1);
-        }
-
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::ConnectPrivate, request, packet);
-        SendPacket(packet, size);
-
-        bool signalled = _apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout));
-
-        // Wait for proxy to be ready if we're using P2P proxy client
-        if (signalled && _connectedProxy) {
-            if (!_connectedProxy->EnsureProxyReady()) {
-                LogFormat("ConnectPrivate: P2P proxy not ready");
-                return MAKERESULT(0xFD, 3);
-            }
-            _config = _connectedProxy->GetProxyConfig();
-        }
-
-        NetworkError error = ConsumeNetworkError();
-        if (error != NetworkError::None) {
-            return MAKERESULT(0xFD, static_cast<int>(error));
-        }
-
-        if (signalled) {
-            return ResultSuccess();
-        } else {
-            return MAKERESULT(0xFD, static_cast<int>(NetworkError::ConnectTimeout));
-        }
-    }
-
-    Result LdnMasterProxyClient::DisconnectNetwork() {
-        LogFormat("DisconnectNetwork");
-
-        if (_networkConnected) {
-            DisconnectMessage msg;
-            msg.reason = DisconnectReason::DisconnectedByUser;
-
-            u8 packet[MaxPacketSize];
-            int size = RyuLdnProtocol::Encode(PacketId::Disconnect, msg, packet);
-            SendPacket(packet, size);
-
-            DisconnectInternal();
-        }
-
-        return ResultSuccess();
-    }
-
-    Result LdnMasterProxyClient::Scan(NetworkInfo* networks, u16* count, const ScanFilter& filter) {
-        LogFormat("Scan");
-
-        _availableGames.clear();
-
-        if (!EnsureConnected()) {
-            *count = 0;
-            return MAKERESULT(0xFD, 1);
-        }
-
-        UpdatePassphraseIfNeeded(_passphrase.c_str());
-
-        _scanEvent->Clear();
-
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::Scan, filter, packet);
-        SendPacket(packet, size);
-
-        bool signalled = _scanEvent->TimedWait(TimeSpan::FromMilliSeconds(ScanTimeout));
-
-        if (!signalled) {
-            *count = 0;
-            return ResultSuccess();
-        }
-
-        u16 found = std::min(static_cast<u16>(_availableGames.size()), *count);
-        for (u16 i = 0; i < found; i++) {
-            networks[i] = _availableGames[i];
-        }
-        *count = found;
-
-        LogFormat("Scan found %d networks", found);
-
-        return ResultSuccess();
-    }
-
-    Result LdnMasterProxyClient::SetAdvertiseData(const u8* data, u16 size) {
-        LogFormat("SetAdvertiseData");
-
-        if (!_networkConnected) {
-            return MAKERESULT(0xFD, 3);
-        }
-
-        u8 packet[MaxPacketSize];
-        int packetSize = RyuLdnProtocol::Encode(PacketId::SetAdvertiseData, data, size, packet);
-        SendPacket(packet, packetSize);
-
-        return ResultSuccess();
-    }
-
-    Result LdnMasterProxyClient::SetStationAcceptPolicy(u8 acceptPolicy) {
-        LogFormat("SetStationAcceptPolicy: %d", acceptPolicy);
-
-        if (!_networkConnected) {
-            return MAKERESULT(0xFD, 3);
-        }
-
-        SetAcceptPolicyRequest request;
-        request.stationAcceptPolicy = acceptPolicy;
-
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::SetAcceptPolicy, request, packet);
-        SendPacket(packet, size);
-
-        return ResultSuccess();
-    }
-
-    Result LdnMasterProxyClient::Reject(DisconnectReason reason, u32 nodeId) {
-        LogFormat("Reject node %d", nodeId);
-
-        if (!_networkConnected) {
-            return MAKERESULT(0xFD, 3);
-        }
-
-        _rejectEvent->Clear();
-
-        RejectRequest request;
-        request.disconnectReason = reason;
-        request.nodeId = nodeId;
-
-        u8 packet[MaxPacketSize];
-        int size = RyuLdnProtocol::Encode(PacketId::Reject, request, packet);
-        SendPacket(packet, size);
-
-        bool signalled = _rejectEvent->TimedWait(TimeSpan::FromMilliSeconds(InactiveTimeout));
-
-        if (!signalled) {
-            return MAKERESULT(0xFD, 4);
-        }
-
-        NetworkError error = ConsumeNetworkError();
-        if (error != NetworkError::None) {
-            return MAKERESULT(0xFD, static_cast<int>(error));
-        }
-
-        return ResultSuccess();
+        
+        os::SleepThread(TimeSpan::FromMilliSeconds(10));
     }
 }
+
+bool LdnMasterProxyClient::EnsureConnected() {
+    if (_connected) return true;
+    LOG_DBG_ARGS(COMP_SVC," EnsureConnected: Attempting connection to %s:%d", _serverAddress.c_str(), _serverPort);
+    _errorEvent->Clear();
+    _connectedEvent->Clear();
+    _socket = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_socket < 0) {
+        LOG_ERR_ARGS(COMP_SVC,"EnsureConnected: socket() failed, errno=%d", errno);
+        return false;
+    }
+    LOG_DBG_ARGS(COMP_SVC," EnsureConnected: Socket created (fd=%d)", _socket);
+    int flags = fcntl(_socket, F_GETFL, 0);
+    fcntl(_socket, F_SETFL, flags | O_NONBLOCK);
+    struct addrinfo hints, *result;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portStr[16];
+    snprintf(portStr, sizeof(portStr), "%d", _serverPort);
+    LOG_DBG_ARGS(COMP_SVC," EnsureConnected: Calling getaddrinfo(%s, %s)", _serverAddress.c_str(), portStr);
+    if (getaddrinfo(_serverAddress.c_str(), portStr, &hints, &result) != 0) {
+        LOG_ERR_ARGS(COMP_SVC,"EnsureConnected: getaddrinfo() failed, errno=%d", errno);
+        close(_socket); _socket = -1; return false;
+    }
+    LOG_DBG(COMP_SVC," EnsureConnected: DNS resolved, attempting connect");
+    int rc = ::connect(_socket, result->ai_addr, result->ai_addrlen);
+    freeaddrinfo(result);
+    if (rc < 0 && errno != EINPROGRESS) {
+        LOG_ERR_ARGS(COMP_SVC,"EnsureConnected: connect() failed, errno=%d", errno);
+        close(_socket); _socket = -1; return false;
+    }
+    LOG_DBG_ARGS(COMP_SVC," EnsureConnected: Connection in progress, polling (timeout=%dms)", FailureTimeout);
+    struct pollfd pfd;
+    pfd.fd = _socket; pfd.events = POLLOUT;
+    int poll_result = poll(&pfd, 1, FailureTimeout);
+    if (poll_result <= 0) {
+        LOG_ERR_ARGS(COMP_SVC,"EnsureConnected: poll() %s, result=%d, errno=%d",
+                  poll_result == 0 ? "timed out" : "failed", poll_result, errno);
+        close(_socket); _socket = -1; return false;
+    }
+    LOG_DBG(COMP_SVC," EnsureConnected: Poll succeeded, checking socket error");
+    int error = 0;
+    socklen_t len = sizeof(error);
+    getsockopt(_socket, SOL_SOCKET, SO_ERROR, &error, &len);
+    if (error != 0) {
+        LOG_ERR_ARGS(COMP_SVC,"EnsureConnected: Socket error after connect: %d", error);
+        close(_socket); _socket = -1; return false;
+    }
+    LOG_INFO(COMP_SVC,"EnsureConnected: Successfully connected to server!");
+
+    // Switch socket back to blocking mode for reliable data transmission
+    flags = fcntl(_socket, F_GETFL, 0);
+    fcntl(_socket, F_SETFL, flags & ~O_NONBLOCK);
+    LOG_DBG(COMP_SVC," Switched socket to blocking mode");
+
+    // Enable TCP_NODELAY to disable Nagle's algorithm (send packets immediately)
+    int nodelay = 1;
+    if (setsockopt(_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) == 0) {
+        LOG_DBG(COMP_SVC," TCP_NODELAY enabled");
+    } else {
+        LOG_WARN_ARGS(COMP_SVC,"Failed to enable TCP_NODELAY, errno=%d", errno);
+    }
+
+    _connected = true;
+    _protocol.Reset();
+    _connectedEvent->Signal();
+
+    // Give the server a moment to be ready
+    os::SleepThread(TimeSpan::FromMilliSeconds(100));
+
+    std::scoped_lock lock(_packetBufferMutex);
+
+    // Debug: Log _initializeMemory content
+    LOG_DBG(COMP_SVC," _initializeMemory content:");
+    LOG_DBG_ARGS(COMP_SVC,"   ID: %02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+              _initializeMemory.id[0], _initializeMemory.id[1], _initializeMemory.id[2], _initializeMemory.id[3],
+              _initializeMemory.id[4], _initializeMemory.id[5], _initializeMemory.id[6], _initializeMemory.id[7],
+              _initializeMemory.id[8], _initializeMemory.id[9], _initializeMemory.id[10], _initializeMemory.id[11],
+              _initializeMemory.id[12], _initializeMemory.id[13], _initializeMemory.id[14], _initializeMemory.id[15]);
+    LOG_DBG_ARGS(COMP_SVC,"   MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+              _initializeMemory.macAddress[0], _initializeMemory.macAddress[1], _initializeMemory.macAddress[2],
+              _initializeMemory.macAddress[3], _initializeMemory.macAddress[4], _initializeMemory.macAddress[5]);
+
+    // Debug: Verify structure sizes
+    LOG_DBG_ARGS(COMP_SVC," sizeof(LdnHeader)=%zu, sizeof(InitializeMessage)=%zu",
+              sizeof(LdnHeader), sizeof(InitializeMessage));
+
+    int size = RyuLdnProtocol::Encode(PacketId::Initialize, _initializeMemory, _packetBuffer.get());
+
+    // Debug: Log the packet being sent
+    LOG_DBG_ARGS(COMP_SVC," Sending Initialize packet: size=%d bytes", size);
+    LOG_DBG(COMP_SVC," Full packet dump (first 32 bytes):");
+    for (int i = 0; i < 32 && i < size; i += 16) {
+        int remaining = size - i;
+        if (remaining >= 16) {
+            LOG_DBG_ARGS(COMP_SVC,"   [%02d-%02d]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                      i, i+15,
+                      _packetBuffer[i+0], _packetBuffer[i+1], _packetBuffer[i+2], _packetBuffer[i+3],
+                      _packetBuffer[i+4], _packetBuffer[i+5], _packetBuffer[i+6], _packetBuffer[i+7],
+                      _packetBuffer[i+8], _packetBuffer[i+9], _packetBuffer[i+10], _packetBuffer[i+11],
+                      _packetBuffer[i+12], _packetBuffer[i+13], _packetBuffer[i+14], _packetBuffer[i+15]);
+        }
+    }
+
+    int sent = SendPacket(_packetBuffer.get(), size);
+    LOG_DBG_ARGS(COMP_SVC," SendPacket returned: %d (expected %d)", sent, size);
+    if (sent != size) {
+        LOG_ERR(COMP_SVC,"Failed to send complete packet!");
+        _connected = false;
+        return false;
+    }
+    return true;
+}
+
+void LdnMasterProxyClient::Disconnect() {
+    if (_socket >= 0) { close(_socket); _socket = -1; }
+    _connected = false;
+    DisconnectInternal();
+}
+
+void LdnMasterProxyClient::DisconnectInternal() {
+    if (_networkConnected) {
+        _networkConnected = false;
+        if (_hostedProxy) { delete _hostedProxy; _hostedProxy = nullptr; }
+        if (_connectedProxy) { delete _connectedProxy; _connectedProxy = nullptr; }
+        
+        // Refresh timeout when disconnecting from network (Ryujinx behavior)
+        if (_timeout) {
+            _timeout->RefreshTimeout();
+        }
+    }
+}
+
+int LdnMasterProxyClient::SendPacket(const u8* data, int size) {
+    if (!_connected || _socket < 0) {
+        LOG_ERR_ARGS(COMP_SVC,"SendPacket: Not connected (_connected=%d, _socket=%d)", _connected, _socket);
+        return -1;
+    }
+    LOG_DBG_ARGS(COMP_SVC," SendPacket: Sending %d bytes", size);
+    
+    // Hex dump for first 64 bytes
+    if (size > 0 && size <= 64) {
+        char hexdump[256] = {0};
+        int hexpos = 0;
+        for (int i = 0; i < size && hexpos < 250; i++) {
+            hexpos += snprintf(hexdump + hexpos, sizeof(hexdump) - hexpos, "%02X ", data[i]);
+        }
+        LOG_DBG_ARGS(COMP_SVC," SendPacket hex dump (%d bytes): %s", size, hexdump);
+    }
+    
+    std::lock_guard<std::mutex> lock(_sendMutex);
+    int sent = 0;
+    while (sent < size) {
+        int rc = ::send(_socket, data + sent, size - sent, 0);
+        if (rc < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                LOG_DBG_ARGS(COMP_SVC," SendPacket: EAGAIN/EWOULDBLOCK, retrying... (sent %d/%d)", sent, size);
+                os::SleepThread(TimeSpan::FromMilliSeconds(1));
+                continue;
+            }
+            LOG_ERR_ARGS(COMP_SVC,"SendPacket: send() failed, errno=%d (sent %d/%d)", errno, sent, size);
+            return -1;
+        }
+        sent += rc;
+        LOG_DBG_ARGS(COMP_SVC," SendPacket: Sent %d bytes (total %d/%d)", rc, sent, size);
+    }
+    LOG_DBG_ARGS(COMP_SVC," SendPacket: Successfully sent all %d bytes", sent);
+    return sent;
+}
+
+int LdnMasterProxyClient::SendRawPacket(const u8* data, int size) { return SendPacket(data, size); }
+
+int LdnMasterProxyClient::ReceiveData() {
+    if (!_connected || _socket < 0) {
+        LOG_ERR_ARGS(COMP_SVC,"ReceiveData: Not connected (_connected=%d, _socket=%d)", _connected, _socket);
+        return -1;
+    }
+    u8 buffer[4096];
+    int received = ::recv(_socket, buffer, sizeof(buffer), MSG_DONTWAIT);
+    if (received < 0) {
+        int err = errno;
+        if (err == EAGAIN || err == EWOULDBLOCK) {
+            LOG_DBG_ARGS(COMP_SVC," ReceiveData: EAGAIN/EWOULDBLOCK (errno=%d)", err);
+            return 0;
+        }
+        LOG_ERR_ARGS(COMP_SVC,"ReceiveData: recv() failed, errno=%d", err);
+        return -1;
+    }
+    if (received == 0) {
+        LOG_WARN(COMP_SVC,"ReceiveData: Connection closed by server (received 0 bytes)");
+        return -1;
+    }
+    LOG_DBG_ARGS(COMP_SVC," ReceiveData: Received %d bytes, processing protocol", received);
+    
+    // Hex dump for debugging
+    if (received > 0 && received <= 64) {
+        char hexdump[256] = {0};
+        int hexpos = 0;
+        for (int i = 0; i < received && hexpos < 250; i++) {
+            hexpos += snprintf(hexdump + hexpos, sizeof(hexdump) - hexpos, "%02X ", buffer[i]);
+        }
+        LOG_DBG_ARGS(COMP_SVC," ReceiveData hex dump (%d bytes): %s", received, hexdump);
+    }
+    
+    _protocol.Read(buffer, 0, received);
+    return received;
+}
+
+void LdnMasterProxyClient::TimeoutConnection() {
+    _connected = false;
+    Disconnect();
+    while (_socket >= 0) {
+        os::SleepThread(TimeSpan::FromMilliSeconds(10));
+    }
+}
+
+void LdnMasterProxyClient::UpdatePassphraseIfNeeded(const char* passphrase) {
+    if (!passphrase || _passphrase == passphrase) return;
+    _passphrase = passphrase;
+    if (_connected) {
+        std::scoped_lock lock(_packetBufferMutex);
+        PassphraseMessage msg{};
+        strncpy(msg.passphrase, passphrase, sizeof(msg.passphrase) - 1);
+        int size = RyuLdnProtocol::Encode(PacketId::Passphrase, msg, _packetBuffer.get());
+        SendPacket(_packetBuffer.get(), size);
+    }
+}
+
+void LdnMasterProxyClient::SetNetworkChangeCallback(NetworkChangeCallback cb) { _networkChangeCallback = cb; }
+void LdnMasterProxyClient::SetProxyConfigCallback(ProxyConfigCallback cb) { _proxyConfigCallback = cb; }
+void LdnMasterProxyClient::SetProxyDataCallback(ProxyDataCallback cb) { _proxyDataCallback = cb; }
+void LdnMasterProxyClient::SetGameVersion(const u8* v, size_t s) { std::memcpy(_gameVersion, v, std::min(s, sizeof(_gameVersion))); }
+void LdnMasterProxyClient::SetPassphrase(const char* p) { UpdatePassphraseIfNeeded(p); }
+
+void LdnMasterProxyClient::HandleInitialize(const LdnHeader&, const InitializeMessage& m) { _initializeMemory = m; }
+void LdnMasterProxyClient::HandleConnected(const LdnHeader&, const NetworkInfo& i) {
+    LOG_INFO(COMP_SVC,"HandleConnected: Network connected");
+    _networkConnected = true; _apConnectedEvent->Signal();
+    if (_networkChangeCallback) {
+        LOG_DBG(COMP_SVC," HandleConnected: Calling network change callback");
+        _networkChangeCallback(i, true);
+    }
+}
+void LdnMasterProxyClient::HandleSyncNetwork(const LdnHeader&, const NetworkInfo& i) {
+    if (_networkChangeCallback) _networkChangeCallback(i, true);
+}
+void LdnMasterProxyClient::HandleDisconnected(const LdnHeader&, const DisconnectMessage& msg) { 
+    LOG_WARN_ARGS(COMP_SVC,"HandleDisconnected: Received disconnect message, reason=%u", msg.reason);
+    _disconnectReason = msg.reason;
+    DisconnectInternal(); 
+}
+void LdnMasterProxyClient::HandleRejectReply(const LdnHeader&) { _rejectEvent->Signal(); }
+void LdnMasterProxyClient::HandleScanReply(const LdnHeader&, const NetworkInfo& i) { _availableGames.push_back(i); }
+void LdnMasterProxyClient::HandleScanReplyEnd(const LdnHeader&) { _scanEvent->Signal(); }
+void LdnMasterProxyClient::HandleProxyConfig(const LdnHeader& h, const ProxyConfig& c) { 
+    _config = c; if (_proxyConfigCallback) _proxyConfigCallback(h, c); 
+}
+void LdnMasterProxyClient::HandleProxyData(const LdnHeader& h, const ProxyDataHeaderFull& hdr, const u8* p, u32 s) {
+    if (_proxyDataCallback) _proxyDataCallback(h, hdr, p, s);
+}
+void LdnMasterProxyClient::HandlePing(const LdnHeader&, const PingMessage& p) {
+    if (p.requester == 0) {
+        std::scoped_lock lock(_packetBufferMutex);
+        int size = RyuLdnProtocol::Encode(PacketId::Ping, p, _packetBuffer.get());
+        SendPacket(_packetBuffer.get(), size);
+    }
+}
+void LdnMasterProxyClient::HandleNetworkError(const LdnHeader&, const NetworkErrorMessage& e) {
+    if (e.error == NetworkError::PortUnreachable) _useP2pProxy = false;
+    else _lastError = e.error;
+}
+
+void LdnMasterProxyClient::HandleExternalProxy(const LdnHeader&, const ExternalProxyConfig& config) {
+    char ipStr[INET_ADDRSTRLEN];
+    if (config.addressFamily == AF_INET) {
+        struct in_addr addr; std::memcpy(&addr.s_addr, config.proxyIp + 12, 4);
+        inet_ntop(AF_INET, &addr, ipStr, sizeof(ipStr));
+    } else return;
+    proxy::P2pProxyClient* client = new (std::nothrow) proxy::P2pProxyClient(ipStr, config.proxyPort);
+    if (!client) return;
+    _connectedProxy = client;
+    if (!client->Connect() || !client->PerformAuth(config)) { delete client; _connectedProxy = nullptr; }
+}
+
+NetworkError LdnMasterProxyClient::ConsumeNetworkError() {
+    NetworkError res = _lastError; _lastError = NetworkError::None; return res;
+}
+
+Result LdnMasterProxyClient::CreateNetwork(const CreateAccessPointRequest& req, const u8* d, u16 s) {
+    LOG_INFO_ARGS(COMP_SVC,"CreateNetwork: Starting network creation, SSID=%s, passphrase_size=%u, useP2pProxy=%d", 
+              req.securityConfig.passphraseSize > 0 ? "***HIDDEN***" : "PUBLIC",
+              req.securityConfig.passphraseSize,
+              _useP2pProxy);
+    
+    if (_timeout) {
+        LOG_DBG(COMP_SVC," CreateNetwork: Disabling timeout before creation");
+        _timeout->DisableTimeout();
+    }
+    
+    if (!EnsureConnected()) {
+        LOG_ERR(COMP_SVC,"CreateNetwork: Failed to connect to master server");
+        DisconnectProxy();
+        return MAKERESULT(0xFD, 1);
+    }
+    
+    LOG_DBG_ARGS(COMP_SVC," CreateNetwork: Configuring network with P2P proxy (_useP2pProxy=%d)", _useP2pProxy);
+    DisconnectInternal();
+    CreateAccessPointRequest mod = req;
+    std::memcpy(mod.ryuNetworkConfig.gameVersion, _gameVersion, sizeof(_gameVersion));
+    ConfigureAccessPoint(mod.ryuNetworkConfig);
+    
+    std::scoped_lock lock(_packetBufferMutex);
+    int sz = RyuLdnProtocol::Encode(PacketId::CreateAccessPoint, mod, d, s, _packetBuffer.get());
+    SendPacket(_packetBuffer.get(), sz);
+    
+    if (_apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) {
+        if (mod.ryuNetworkConfig.externalProxyPort != 0) {
+            LOG_INFO_ARGS(COMP_SVC,"CreateNetwork: P2P proxy configured on external port %u", 
+                     mod.ryuNetworkConfig.externalProxyPort);
+        } else {
+            LOG_INFO(COMP_SVC,"CreateNetwork: Using master server relay (no P2P proxy)");
+        }
+        
+        // Send immediate NetworkChange event with dummy NetworkInfo (Ryujinx behavior)
+        // This prevents games from crashing with uninitialized structures
+        NetworkInfo dummyInfo = {};
+        
+        // Set basic network info from request
+        dummyInfo.networkId.intentId.localCommunicationId = req.networkConfig.intentId.localCommunicationId;
+        dummyInfo.networkId.intentId.sceneId = req.networkConfig.intentId.sceneId;
+        dummyInfo.networkId.sessionId.high = 0x0001020304050607ULL;
+        dummyInfo.networkId.sessionId.low = 0x08090A0B0C0D0E0FULL;
+        
+        // Set common network info
+        dummyInfo.common.bssid.raw[0] = 0x00;
+        dummyInfo.common.bssid.raw[1] = 0xA0;
+        dummyInfo.common.bssid.raw[2] = 0xC9;
+        dummyInfo.common.bssid.raw[3] = 0x52;
+        dummyInfo.common.bssid.raw[4] = 0x00;
+        dummyInfo.common.bssid.raw[5] = 0x00;
+        
+        dummyInfo.common.ssid.length = strlen("Nintendo_AP");
+        std::strcpy(dummyInfo.common.ssid.raw, "Nintendo_AP");
+        dummyInfo.common.channel = 6;
+        dummyInfo.common.linkLevel = 100;
+        dummyInfo.common.networkType = 0;  // Adhoc
+        
+        // Set LDN network info
+        dummyInfo.ldn.nodeCountMax = req.networkConfig.nodeCountMax;
+        dummyInfo.ldn.nodeCount = 1;  // Just the host
+        dummyInfo.ldn.securityMode = 2;  // WEP
+        dummyInfo.ldn.stationAcceptPolicy = 1;
+        
+        // Set host node info
+        dummyInfo.ldn.nodes[0].nodeId = 0;
+        dummyInfo.ldn.nodes[0].isConnected = 1;
+        dummyInfo.ldn.nodes[0].ipv4Address = 0xC0A8001ULL;  // 192.168.0.1
+        dummyInfo.ldn.nodes[0].macAddress = dummyInfo.common.bssid;
+        dummyInfo.ldn.nodes[0].localCommunicationVersion = req.networkConfig.localCommunicationVersion;
+        
+        // Copy advertise data to host node's userName as per LDN spec
+        if (s > 0 && s <= UserNameBytesMax) {
+            std::memcpy(dummyInfo.ldn.nodes[0].userName, d, s);
+            dummyInfo.ldn.nodes[0].userName[s] = '\0';
+        } else {
+            std::strcpy(dummyInfo.ldn.nodes[0].userName, "HOST");
+        }
+        
+        // Store for NetworkChange callback delivery
+        _lastNetworkInfo = dummyInfo;
+        
+        // Signal the network change event
+        if (_networkChangeCallback) {
+            _networkChangeCallback(dummyInfo, true);
+            LOG_INFO(COMP_SVC,"CreateNetwork: Sent immediate NetworkChange event");
+        }
+        
+        return ResultSuccess();
+    }
+    LOG_ERR(COMP_SVC,"CreateNetwork: Timeout waiting for access point creation");
+    return MAKERESULT(0xFD, 2);
+}
+
+Result LdnMasterProxyClient::Connect(const ConnectRequest& req) {
+    if (_timeout) {
+        _timeout->DisableTimeout();
+    }
+    
+    LOG_DBG(COMP_SVC," Connect: Attempting to connect to network");
+    if (!EnsureConnected()) {
+        LOG_ERR(COMP_SVC,"Connect: Failed to connect to master server");
+        return MAKERESULT(0xFD, 1);
+    }
+    std::scoped_lock lock(_packetBufferMutex);
+    int sz = RyuLdnProtocol::Encode(PacketId::Connect, req, _packetBuffer.get());
+    SendPacket(_packetBuffer.get(), sz);
+    if (_apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) {
+        LOG_INFO(COMP_SVC,"Connect: Successfully connected to network");
+        return ResultSuccess();
+    }
+    LOG_ERR(COMP_SVC,"Connect: Timeout waiting for connection");
+    return MAKERESULT(0xFD, 2);
+}
+
+Result LdnMasterProxyClient::Scan(NetworkInfo* nets, u16* count, const ScanFilter& f) {
+    LOG_INFO(COMP_SVC,"Scan: Starting scan operation");
+    // Reset timeout only if not connected to a network (Ryujinx behavior)
+    if (!_networkConnected && _timeout) {
+        LOG_DBG(COMP_SVC," Scan: Refreshing timeout (not network connected)");
+        _timeout->RefreshTimeout();
+    }
+
+    // Clear previous results
+    _availableGames.clear();
+    
+    if (!EnsureConnected()) { 
+        LOG_ERR(COMP_SVC,"Scan: Failed to ensure connection to master server");
+        *count = 0;
+        return MAKERESULT(0xFD, 1); 
+    }
+    
+    LOG_DBG(COMP_SVC," Scan: Connected, sending scan request");
+    // Reset scan event and send scan request
+    _scanEvent->Clear();
+    {
+        std::scoped_lock lock(_packetBufferMutex);
+        int sz = RyuLdnProtocol::Encode(PacketId::Scan, f, _packetBuffer.get());
+        LOG_DBG_ARGS(COMP_SVC," Scan: Encoded packet size=%d", sz);
+        SendPacket(_packetBuffer.get(), sz);
+    }
+    
+    LOG_DBG_ARGS(COMP_SVC," Scan: Waiting for scan results (timeout=%ums)", ScanTimeout);
+    // Wait for scan completion (ScanReplyEnd) with timeout
+    if (!_scanEvent->TimedWait(TimeSpan::FromMilliSeconds(ScanTimeout))) { 
+        LOG_WARN_ARGS(COMP_SVC,"Scan: Timeout waiting for scan results after %ums", ScanTimeout);
+        *count = 0;
+        return ResultSuccess();  // Timeout is not an error
+    }
+    
+    // Copy results
+    u16 found = std::min(static_cast<u16>(_availableGames.size()), *count);
+    for (u16 i = 0; i < found; i++) nets[i] = _availableGames[i];
+    *count = found;
+    LOG_INFO_ARGS(COMP_SVC,"Scan: Completed, found %u networks", found);
+    return ResultSuccess();
+}
+
+Result LdnMasterProxyClient::DisconnectNetwork() {
+    if (_networkConnected) {
+        DisconnectMessage msg{DisconnectReason::DisconnectedByUser};
+        std::scoped_lock lock(_packetBufferMutex);
+        int sz = RyuLdnProtocol::Encode(PacketId::Disconnect, msg, _packetBuffer.get());
+        SendPacket(_packetBuffer.get(), sz);
+        DisconnectInternal();
+    }
+    return ResultSuccess();
+}
+
+Result LdnMasterProxyClient::SetAdvertiseData(const u8* d, u16 s) {
+    if (!_networkConnected) return MAKERESULT(0xFD, 3);
+    std::scoped_lock lock(_packetBufferMutex);
+    int sz = RyuLdnProtocol::Encode(PacketId::SetAdvertiseData, d, s, _packetBuffer.get());
+    SendPacket(_packetBuffer.get(), sz);
+    return ResultSuccess();
+}
+
+Result LdnMasterProxyClient::SetStationAcceptPolicy(u8 p) {
+    if (!_networkConnected) return MAKERESULT(0xFD, 3);
+    SetAcceptPolicyRequest req{p};
+    std::scoped_lock lock(_packetBufferMutex);
+    int sz = RyuLdnProtocol::Encode(PacketId::SetAcceptPolicy, req, _packetBuffer.get());
+    SendPacket(_packetBuffer.get(), sz);
+    return ResultSuccess();
+}
+
+Result LdnMasterProxyClient::Reject(DisconnectReason reason, u32 nodeId) {
+    if (!_networkConnected) return MAKERESULT(0xFD, 3);
+    _rejectEvent->Clear();
+    RejectRequest req;
+    std::memset(&req, 0, sizeof(req));
+    req.disconnectReason = reason;
+    req.nodeId = nodeId;
+    std::scoped_lock lock(_packetBufferMutex);
+    int sz = RyuLdnProtocol::Encode(PacketId::Reject, req, _packetBuffer.get());
+    SendPacket(_packetBuffer.get(), sz);
+    if (_rejectEvent->TimedWait(TimeSpan::FromMilliSeconds(InactiveTimeout))) return ResultSuccess();
+    return MAKERESULT(0xFD, 4);
+}
+
+Result LdnMasterProxyClient::CreateNetworkPrivate(const CreateAccessPointPrivateRequest& req, const u8* d, u16 s) {
+    if (_timeout) {
+        _timeout->DisableTimeout();
+    }
+    
+    if (!EnsureConnected()) {
+        DisconnectProxy();
+        return MAKERESULT(0xFD, 1);
+    }
+    std::scoped_lock lock(_packetBufferMutex);
+    int sz = RyuLdnProtocol::Encode(PacketId::CreateAccessPointPrivate, req, d, s, _packetBuffer.get());
+    SendPacket(_packetBuffer.get(), sz);
+    if (_apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) return ResultSuccess();
+    return MAKERESULT(0xFD, 2);
+}
+
+Result LdnMasterProxyClient::ConnectPrivate(const ConnectPrivateRequest& req) {
+    if (_timeout) {
+        _timeout->DisableTimeout();
+    }
+    
+    if (!EnsureConnected()) return MAKERESULT(0xFD, 1);
+    std::scoped_lock lock(_packetBufferMutex);
+    int sz = RyuLdnProtocol::Encode(PacketId::ConnectPrivate, req, _packetBuffer.get());
+    SendPacket(_packetBuffer.get(), sz);
+    if (_apConnectedEvent->TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) return ResultSuccess();
+    return MAKERESULT(0xFD, 2);
+}
+
+void LdnMasterProxyClient::ConfigureAccessPoint(RyuNetworkConfig& config) {
+    if (!_useP2pProxy) {
+        config.externalProxyPort = 0;
+        config.internalProxyPort = 0;
+        LOG_DBG(COMP_SVC," ConfigureAccessPoint: P2P proxy disabled");
+        return;
+    }
+    
+    // Attempt to create P2P proxy server on a port range
+    for (u16 i = 0; i < proxy::P2pProxyServer::PrivatePortRange; i++) {
+        u16 port = proxy::P2pProxyServer::PrivatePortBase + i;
+        _hostedProxy = new proxy::P2pProxyServer(this, port, &_protocol);
+        
+        if (!_hostedProxy->Start()) {
+            delete _hostedProxy;
+            _hostedProxy = nullptr;
+            continue;
+        }
+        
+        LOG_DBG_ARGS(COMP_SVC," ConfigureAccessPoint: P2P proxy server started on port %u", port);
+        
+        // Successfully started proxy, attempt UPnP NAT punch
+        u16 externalPort = _hostedProxy->NatPunch();
+        if (externalPort != 0) {
+            // UPnP successful - configure external proxy
+            config.externalProxyPort = externalPort;
+            config.internalProxyPort = port;
+            config.addressFamily = 2;  // InterNetwork (IPv4)
+            LOG_INFO_ARGS(COMP_SVC,"ConfigureAccessPoint: Created P2P proxy on external port %u, internal port %u", 
+                     externalPort, port);
+            return;
+        }
+        
+        // UPnP failed, cleanup and fall back to server proxy
+        LOG_WARN_ARGS(COMP_SVC,"ConfigureAccessPoint: UPnP NAT punch failed on port %u, trying next port", port);
+        _hostedProxy->Stop();
+        delete _hostedProxy;
+        _hostedProxy = nullptr;
+    }
+    
+    // All ports failed or no UPnP, fall back to server proxy relay
+    config.externalProxyPort = 0;
+    config.internalProxyPort = 0;
+    LOG_WARN(COMP_SVC,"ConfigureAccessPoint: Could not open external P2P port, falling back to server relay");
+}
+
+void LdnMasterProxyClient::DisconnectProxy() {
+    if (_hostedProxy) {
+        _hostedProxy->Stop();
+        delete _hostedProxy;
+        _hostedProxy = nullptr;
+    }
+    
+    if (_connectedProxy) {
+        delete _connectedProxy;
+        _connectedProxy = nullptr;
+    }
+}
+
+} // namespace ams::mitm::ldn::ryuldn

@@ -31,7 +31,7 @@ namespace ams::mitm::ldn::ryuldn {
     private:
         static constexpr int HeaderSize = sizeof(LdnHeader);
 
-        u8 _buffer[MaxPacketSize];
+        std::unique_ptr<u8[]> _buffer;  // Dynamic allocation to reduce object size
         int _bufferEnd;
 
         void DecodeAndHandle(const LdnHeader& header, const u8* data);
@@ -42,8 +42,8 @@ namespace ams::mitm::ldn::ryuldn {
         }
 
     public:
-        RyuLdnProtocol();
-        ~RyuLdnProtocol();
+        RyuLdnProtocol() : _buffer(std::make_unique<u8[]>(MaxPacketSize)), _bufferEnd(0) {}
+        ~RyuLdnProtocol() = default;
 
         void Reset();
         void Read(const u8* data, int offset, int size);
@@ -84,8 +84,9 @@ namespace ams::mitm::ldn::ryuldn {
         static int Encode(PacketId type, const T& packet, u8* output) {
             LdnHeader header;
             header.magic = RyuLdnMagic;
-            header.version = ProtocolVersion;
             header.type = static_cast<u8>(type);
+            header.version = ProtocolVersion;
+            header._padding = 0;  // Initialize padding to zero
             header.dataSize = sizeof(T);
 
             std::memcpy(output, &header, HeaderSize);
@@ -98,8 +99,9 @@ namespace ams::mitm::ldn::ryuldn {
         static int Encode(PacketId type, const T& packet, const u8* extraData, int extraDataSize, u8* output) {
             LdnHeader header;
             header.magic = RyuLdnMagic;
-            header.version = ProtocolVersion;
             header.type = static_cast<u8>(type);
+            header.version = ProtocolVersion;
+            header._padding = 0;  // Initialize padding to zero
             header.dataSize = sizeof(T) + extraDataSize;
 
             std::memcpy(output, &header, HeaderSize);

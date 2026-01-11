@@ -1,7 +1,7 @@
 KIPS := ryuldn_nx
 OVERLAY := overlay
 
-SUBFOLDERS := Atmosphere-libs/libstratosphere $(KIPS) #$(OVERLAY)
+SUBFOLDERS := Atmosphere-libs/libstratosphere $(KIPS) $(OVERLAY)
 
 TOPTARGETS := all clean
 

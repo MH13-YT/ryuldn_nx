@@ -11,6 +11,7 @@
     "pool_partition": 2,
     "is_64_bit": true,
     "address_space_type": 3,
+    "heap_size": "0x600000",
     "filesystem_access": {
         "permissions": "0xFFFFFFFFFFFFFFFF"
     },

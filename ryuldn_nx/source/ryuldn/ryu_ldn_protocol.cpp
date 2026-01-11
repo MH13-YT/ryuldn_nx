@@ -5,15 +5,9 @@
 
 namespace ams::mitm::ldn::ryuldn {
 
-    RyuLdnProtocol::RyuLdnProtocol() : _bufferEnd(0) {
-        std::memset(_buffer, 0, sizeof(_buffer));
-    }
-
-    RyuLdnProtocol::~RyuLdnProtocol() {
-    }
-
     void RyuLdnProtocol::Reset() {
         _bufferEnd = 0;
+        if (_buffer) std::memset(_buffer.get(), 0, MaxPacketSize);
     }
 
     void RyuLdnProtocol::Read(const u8* data, int offset, int size) {
@@ -23,7 +17,7 @@ namespace ams::mitm::ldn::ryuldn {
             if (_bufferEnd < HeaderSize) {
                 // Assemble the header first
                 int copyable = std::min(size - index, HeaderSize - _bufferEnd);
-                std::memcpy(_buffer + _bufferEnd, data + offset + index, copyable);
+                std::memcpy(_buffer.get() + _bufferEnd, data + offset + index, copyable);
 
                 index += copyable;
                 _bufferEnd += copyable;
@@ -32,16 +26,16 @@ namespace ams::mitm::ldn::ryuldn {
             if (_bufferEnd >= HeaderSize) {
                 // The header is available. Make sure we received all the data
                 LdnHeader ldnHeader;
-                std::memcpy(&ldnHeader, _buffer, HeaderSize);
+                std::memcpy(&ldnHeader, _buffer.get(), HeaderSize);
 
                 if (ldnHeader.magic != RyuLdnMagic) {
-                    LogFormat("RyuLDN: Invalid magic number in received packet: 0x%08x", ldnHeader.magic);
+                    LOG_ERR_ARGS(COMP_RLDN_PROTOCOL,"Invalid magic number in received packet: 0x%08x", ldnHeader.magic);
                     Reset();
                     return;
                 }
 
                 if (ldnHeader.version != ProtocolVersion) {
-                    LogFormat("RyuLDN: Protocol version mismatch. Expected %d, got %d", ProtocolVersion, ldnHeader.version);
+                    LOG_ERR_ARGS(COMP_RLDN_PROTOCOL,"Protocol version mismatch. Expected %d, got %d", ProtocolVersion, ldnHeader.version);
                     Reset();
                     return;
                 }
@@ -49,20 +43,20 @@ namespace ams::mitm::ldn::ryuldn {
                 int finalSize = HeaderSize + ldnHeader.dataSize;
 
                 if (finalSize >= MaxPacketSize) {
-                    LogFormat("RyuLDN: Max packet size %d exceeded: %d", MaxPacketSize, finalSize);
+                    LOG_ERR_ARGS(COMP_RLDN_PROTOCOL,"Max packet size %d exceeded: %d", MaxPacketSize, finalSize);
                     Reset();
                     return;
                 }
 
                 int copyable = std::min(size - index, finalSize - _bufferEnd);
-                std::memcpy(_buffer + _bufferEnd, data + offset + index, copyable);
+                std::memcpy(_buffer.get() + _bufferEnd, data + offset + index, copyable);
 
                 index += copyable;
                 _bufferEnd += copyable;
 
                 if (finalSize == _bufferEnd) {
                     // The full packet has been retrieved. Decode it
-                    const u8* ldnData = _buffer + HeaderSize;
+                    const u8* ldnData = _buffer.get() + HeaderSize;
 
                     DecodeAndHandle(ldnHeader, ldnData);
 
@@ -237,7 +231,7 @@ namespace ams::mitm::ldn::ryuldn {
             }
 
             default:
-                LogFormat("RyuLDN: Unhandled packet type: %d", static_cast<int>(packetId));
+                LOG_ERR_ARGS(COMP_RLDN_PROTOCOL,"Unhandled packet type: %d", static_cast<int>(packetId));
                 break;
         }
     }
@@ -245,8 +239,9 @@ namespace ams::mitm::ldn::ryuldn {
     void RyuLdnProtocol::EncodeHeader(PacketId type, int dataSize, u8* output) {
         LdnHeader header;
         header.magic = RyuLdnMagic;
-        header.version = ProtocolVersion;
         header.type = static_cast<u8>(type);
+        header.version = ProtocolVersion;
+        header._padding = 0;  // Initialize padding to zero
         header.dataSize = dataSize;
 
         std::memcpy(output, &header, HeaderSize);
@@ -255,8 +250,9 @@ namespace ams::mitm::ldn::ryuldn {
     int RyuLdnProtocol::Encode(PacketId type, u8* output) {
         LdnHeader header;
         header.magic = RyuLdnMagic;
-        header.version = ProtocolVersion;
         header.type = static_cast<u8>(type);
+        header.version = ProtocolVersion;
+        header._padding = 0;  // Initialize padding to zero
         header.dataSize = 0;
 
         std::memcpy(output, &header, HeaderSize);
@@ -267,8 +263,9 @@ namespace ams::mitm::ldn::ryuldn {
     int RyuLdnProtocol::Encode(PacketId type, const u8* data, int dataSize, u8* output) {
         LdnHeader header;
         header.magic = RyuLdnMagic;
-        header.version = ProtocolVersion;
         header.type = static_cast<u8>(type);
+        header.version = ProtocolVersion;
+        header._padding = 0;  // Initialize padding to zero
         header.dataSize = dataSize;
 
         std::memcpy(output, &header, HeaderSize);

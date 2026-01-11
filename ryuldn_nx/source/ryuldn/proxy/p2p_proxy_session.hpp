@@ -26,6 +26,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         std::unique_ptr<u8[]> _threadStack;
         static constexpr size_t ThreadStackSize = 0x4000;
 
+        // Receive buffer to avoid stack overflow
+        std::unique_ptr<u8[]> _receiveBuffer;
+
         static void ReceiveThreadFunc(void* arg);
         void ReceiveLoop();
 

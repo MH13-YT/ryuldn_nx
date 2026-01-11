@@ -13,6 +13,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
           _masterClosed(false),
           _running(false)
     {
+        LOG_HEAP(COMP_RLDN_P2P_SES, "P2pProxySession constructor start");
         // Register protocol handlers
         _protocol.onExternalProxy = [this](const LdnHeader& header, const ExternalProxyConfig& token) {
             HandleAuthentication(header, token);
@@ -34,7 +35,11 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             HandleProxyConnect(header, request);
         };
 
-        LogFormat("P2pProxySession: Created for socket %d", _socket);
+        // Allocate receive buffer to avoid stack overflow in ReceiveLoop
+        _receiveBuffer = std::make_unique<u8[]>(8192);
+
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SES, "P2pProxySession: Created for socket %d", _socket);
+        LOG_HEAP(COMP_RLDN_P2P_SES, "P2pProxySession constructor end");
     }
 
     P2pProxySession::~P2pProxySession() {
@@ -45,7 +50,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _socket = -1;
         }
 
-        LogFormat("P2pProxySession: Destroyed");
+        LOG_INFO(COMP_RLDN_P2P_SES, "P2pProxySession: Destroyed");
     }
 
     bool P2pProxySession::Start() {
@@ -54,20 +59,27 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         }
 
         // Allocate thread stack
+        LOG_HEAP(COMP_RLDN_P2P_SES, "before P2pProxySession thread stack");
         _threadStack = std::make_unique<u8[]>(ThreadStackSize + os::ThreadStackAlignment);
+        if (!_threadStack) {
+            LOG_INFO(COMP_RLDN_P2P_SES, "P2pProxySession: Failed to allocate thread stack");
+            LOG_HEAP(COMP_RLDN_P2P_SES, "after P2pProxySession thread stack FAILED");
+            return false;
+        }
+        LOG_HEAP(COMP_RLDN_P2P_SES, "after P2pProxySession thread stack");
         void* stackTop = reinterpret_cast<void*>(util::AlignUp(reinterpret_cast<uintptr_t>(_threadStack.get()), os::ThreadStackAlignment));
 
         // Create receive thread
         Result rc = os::CreateThread(&_receiveThread, ReceiveThreadFunc, this, stackTop, ThreadStackSize, 0x2C, 3);
         if (R_FAILED(rc)) {
-            LogFormat("P2pProxySession: Failed to create receive thread: 0x%x", rc);
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SES, "P2pProxySession: Failed to create receive thread: 0x%x", rc);
             return false;
         }
 
         _running = true;
         os::StartThread(&_receiveThread);
 
-        LogFormat("P2pProxySession: Started");
+        LOG_INFO(COMP_RLDN_P2P_SES, "P2pProxySession: Started");
         return true;
     }
 
@@ -86,7 +98,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         os::WaitThread(&_receiveThread);
         os::DestroyThread(&_receiveThread);
 
-        LogFormat("P2pProxySession: Stopped");
+        LOG_INFO(COMP_RLDN_P2P_SES, "P2pProxySession: Stopped");
     }
 
     void P2pProxySession::DisconnectAndStop() {
@@ -100,19 +112,20 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     }
 
     void P2pProxySession::ReceiveLoop() {
-        u8 buffer[8192];
+        u8* buffer = _receiveBuffer.get();
+        constexpr size_t bufferSize = 8192;
 
         while (_running) {
-            ssize_t received = recv(_socket, buffer, sizeof(buffer), 0);
+            ssize_t received = recv(_socket, buffer, bufferSize, 0);
 
             if (received > 0) {
                 _protocol.Read(buffer, 0, received);
             } else if (received == 0) {
-                LogFormat("P2pProxySession: Client disconnected");
+                LOG_INFO(COMP_RLDN_P2P_SES, "P2pProxySession: Client disconnected");
                 break;
             } else {
                 if (errno != EINTR) {
-                    LogFormat("P2pProxySession: Receive error: %d", errno);
+                    LOG_INFO_ARGS(COMP_RLDN_P2P_SES, "P2pProxySession: Receive error: %d", errno);
                     break;
                 }
             }
@@ -135,10 +148,10 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
     void P2pProxySession::HandleAuthentication([[maybe_unused]] const LdnHeader& header, const ExternalProxyConfig& token) {
         if (!_parent->TryRegisterUser(this, token)) {
-            LogFormat("P2pProxySession: Authentication failed");
+            LOG_INFO(COMP_RLDN_P2P_SES, "P2pProxySession: Authentication failed");
             DisconnectAndStop();
         } else {
-            LogFormat("P2pProxySession: Authenticated successfully");
+            LOG_INFO(COMP_RLDN_P2P_SES, "P2pProxySession: Authenticated successfully");
         }
     }
 

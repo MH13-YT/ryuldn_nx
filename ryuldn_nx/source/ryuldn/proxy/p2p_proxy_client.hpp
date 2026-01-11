@@ -40,6 +40,10 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         std::unique_ptr<u8[]> _threadStack;
         static constexpr size_t ThreadStackSize = 0x4000;
 
+        // Shared packet buffer to avoid stack overflow
+        std::unique_ptr<u8[]> _packetBuffer;
+        os::Mutex _packetBufferMutex;
+
         // Protocol handlers
         void HandleProxyConfig(const LdnHeader& header, const ProxyConfig& config);
 

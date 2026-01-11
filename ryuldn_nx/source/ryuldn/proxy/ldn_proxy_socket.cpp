@@ -1,6 +1,7 @@
 #include "ldn_proxy_socket.hpp"
 #include "ldn_proxy.hpp"
 #include "../../debug.hpp"
+
 #include <arpa/inet.h>
 #include <cstring>
 #include <algorithm>
@@ -31,6 +32,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
           _protocolType(protocolType),
           _blocking(true)
     {
+        LOG_HEAP(COMP_RLDN_PROXY_SOC,"LdnProxySocket constructor start");
         std::memset(&_remoteEndPoint, 0, sizeof(_remoteEndPoint));
         std::memset(&_localEndPoint, 0, sizeof(_localEndPoint));
         std::memset(&_connectResponse, 0, sizeof(_connectResponse));
@@ -52,7 +54,8 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Register with proxy
         _proxy->RegisterSocket(this);
 
-        LogFormat("LdnProxySocket created: family=%d, type=%d, proto=%d", addressFamily, socketType, protocolType);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY_SOC,"LdnProxySocket created: family=%d, type=%d, proto=%d", addressFamily, socketType, protocolType);
+        LOG_HEAP(COMP_RLDN_PROXY_SOC,"LdnProxySocket constructor end");
     }
 
     LdnProxySocket::~LdnProxySocket() {
@@ -176,7 +179,16 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                     // Yes - let's accept
                     sockaddr_in remoteEndpoint = GetEndpoint(request.info.sourceIpV4, request.info.sourcePort);
 
-                    LdnProxySocket* socket = new LdnProxySocket(_addressFamily, _socketType, _protocolType, _proxy);
+                    LOG_HEAP(COMP_RLDN_PROXY_SOC,"before LdnProxySocket");
+                    LdnProxySocket* socket = new (std::nothrow) LdnProxySocket(_addressFamily, _socketType, _protocolType, _proxy);
+                    if (socket == nullptr) {
+                        LOG_INFO(COMP_RLDN_PROXY_SOC,"ERROR: Failed to allocate LdnProxySocket - out of memory");
+                        LOG_HEAP(COMP_RLDN_PROXY_SOC,"after LdnProxySocket FAILED");
+                        *out_socket = nullptr;
+                        return;
+                    }
+                    LOG_HEAP(COMP_RLDN_PROXY_SOC,"after LdnProxySocket");
+
                     socket->AsAccepted(remoteEndpoint);
 
                     {
@@ -208,7 +220,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         _localEndPoint = asIPEndpoint;
         _isBound = true;
 
-        LogFormat("LdnProxySocket::Bind - port %u", ntohs(_localEndPoint.sin_port));
+        LOG_INFO_ARGS(COMP_RLDN_PROXY_SOC,"LdnProxySocket::Bind - port %u", ntohs(_localEndPoint.sin_port));
     }
 
     void LdnProxySocket::Close() {
@@ -234,7 +246,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         _isListening = false;
 
-        LogFormat("LdnProxySocket::Close");
+        LOG_INFO(COMP_RLDN_PROXY_SOC,"LdnProxySocket::Close");
     }
 
     void LdnProxySocket::Connect(const sockaddr_in* remoteEP) {
@@ -264,7 +276,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         }
 
         _connectResponse = {}; // Reset
-        LogFormat("LdnProxySocket::Connect - connected");
+        LOG_INFO(COMP_RLDN_PROXY_SOC,"LdnProxySocket::Connect - connected");
     }
 
     void LdnProxySocket::Disconnect([[maybe_unused]] bool reuseSocket) {
@@ -275,7 +287,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _connected = false;
         }
 
-        LogFormat("LdnProxySocket::Disconnect");
+        LOG_INFO(COMP_RLDN_PROXY_SOC,"LdnProxySocket::Disconnect");
     }
 
     void LdnProxySocket::Listen(s32 backlog) {
@@ -285,7 +297,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         _isListening = true;
 
-        LogFormat("LdnProxySocket::Listen - backlog %d", backlog);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY_SOC,"LdnProxySocket::Listen - backlog %d", backlog);
     }
 
     s32 LdnProxySocket::Receive(u8* buffer, size_t bufferSize, s32 flags) {
@@ -399,7 +411,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _writeShutdown = true;
         }
 
-        LogFormat("LdnProxySocket::Shutdown - how %d", how);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY_SOC,"LdnProxySocket::Shutdown - how %d", how);
     }
 
     s32 LdnProxySocket::GetSocketOption(SocketOptionName optionName) {
@@ -419,7 +431,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _broadcast = (optionValue != 0);
         }
 
-        LogFormat("LdnProxySocket::SetSocketOption - %d = %d", static_cast<s32>(optionName), optionValue);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY_SOC,"LdnProxySocket::SetSocketOption - %d = %d", static_cast<s32>(optionName), optionValue);
     }
 
     s32 LdnProxySocket::GetAvailable() const {

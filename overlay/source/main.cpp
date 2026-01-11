@@ -13,6 +13,40 @@ LdnMitmConfigService g_ldnConfig;
 State g_state;
 char g_version[32];
 
+// --- LoggingLevelSelector (popup) ---
+
+class LoggingLevelSelector : public tsl::Gui {
+private:
+    tsl::elm::List* m_list;
+    std::function<void(u32)> m_onSelected;
+
+public:
+    LoggingLevelSelector(u32 currentLevel, std::function<void(u32)> onSelected)
+        : m_onSelected(onSelected) {
+        m_list = new tsl::elm::List();
+
+        const char* levels[] = {"ERR", "WARN", "INFO", "DBG", "TRC"};
+        for (int i = 0; i < 5; i++) {
+            auto item = new tsl::elm::ListItem(levels[i]);
+            item->setClickListener([this, i](u64 keys) -> bool {
+                if (keys & HidNpadButton_A) {
+                    m_onSelected(i + 1);  // 1=ERR, 2=WARN, etc.
+                    tsl::goBack();         // ferme ce Gui
+                    return true;
+                }
+                return false;
+            });
+            m_list->addItem(item);
+        }
+    }
+
+    virtual tsl::elm::Element* createUI() override {
+        auto frame = new tsl::elm::OverlayFrame("Logging Level", "Select level");
+        frame->setContent(m_list);
+        return frame;
+    }
+};
+
 class EnabledToggleListItem : public tsl::elm::ToggleListItem {
 public:
     EnabledToggleListItem() : ToggleListItem("Enabled", false) {
@@ -41,7 +75,7 @@ public:
         u32 enabled;
         Result rc;
 
-        rc = ldnMitmGetLogging(&g_ldnConfig, &enabled);
+        rc = ldnMitmGetLoggingEnabled(&g_ldnConfig, &enabled);
         if (R_FAILED(rc)) {
             g_state = State::Error;
         }
@@ -49,10 +83,45 @@ public:
         this->setState(enabled);
 
         this->setStateChangedListener([](bool enabled) {
-            Result rc = ldnMitmSetLogging(&g_ldnConfig, enabled);
+            Result rc = ldnMitmSetLoggingEnabled(&g_ldnConfig, enabled);
             if (R_FAILED(rc)) {
                 g_state = State::Error;
             }
+        });
+    }
+};
+
+class LoggingLevelListItem : public tsl::elm::ListItem {
+    u32 level = 1;
+
+    const char* getLevelString(u32 l) {
+        static const char* strs[] = {"ERR", "WARN", "INFO", "DBG", "TRC"};
+        return strs[(l-1)%5];
+    }
+
+public:
+    LoggingLevelListItem() : ListItem("Logging Level") {
+        Result rc = ldnMitmGetLoggingLevel(&g_ldnConfig, &level);
+        if (R_FAILED(rc)) {
+            g_state = State::Error;
+            level = 1;
+        }
+        this->setValue(getLevelString(level));
+
+        // Ouvre un sélecteur au clic
+        this->setClickListener([this](u64 keys) -> bool {
+            if (!(keys & HidNpadButton_A))
+                return false;
+
+            tsl::changeTo<LoggingLevelSelector>(level, [this](u32 new_level) {
+                Result rc = ldnMitmSetLoggingLevel(&g_ldnConfig, new_level);
+                if (R_SUCCEEDED(rc)) {
+                    level = new_level;
+                    this->setValue(getLevelString(level));
+                }
+                // Sinon, on garde l’ancien niveau
+            });
+            return true;
         });
     }
 };
@@ -62,31 +131,33 @@ public:
     MainGui() { }
 
     virtual tsl::elm::Element* createUI() override {
-        auto frame = new tsl::elm::OverlayFrame("ldn_mitm", g_version);
+        auto frame = new tsl::elm::OverlayFrame("RyuLDN_NX Manager", g_version);
 
         auto list = new tsl::elm::List();
 
         if (g_state == State::Error) {
-            list->addItem(new tsl::elm::ListItem("ldn_mitm is not loaded."));
+            list->addItem(new tsl::elm::ListItem("RyuLDN_NX is not loaded."));
         } else if (g_state == State::Uninit) {
             list->addItem(new tsl::elm::ListItem("wrong state"));
         } else {
             list->addItem(new EnabledToggleListItem());
             list->addItem(new LoggingToggleListItem());
+            list->addItem(new LoggingLevelListItem());
         }
 
         frame->setContent(list);
-        
+
         return frame;
     }
 
-    // Called once every frame to update values
     virtual void update() override {
-
+        // Si tu veux rafraîchir des valeurs périodiquement, fais-le ici
     }
 
-    // Called once every frame to handle inputs not handled by other UI elements
-    virtual bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchPos, HidAnalogStickState joyStickPosLeft, HidAnalogStickState joyStickPosRight) {
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState &touchPos,
+                             HidAnalogStickState joyStickPosLeft,
+                             HidAnalogStickState joyStickPosRight) {
         return false;
     }
 };
@@ -117,18 +188,18 @@ public:
 
             g_state = State::Loaded;
         });
-
     }
+
     virtual void exitServices() override {
         serviceClose(&g_ldnConfig.s);
         serviceClose(&g_ldnSrv);
     }
 
-    virtual void onShow() override {}    // Called before overlay wants to change from invisible to visible state
-    virtual void onHide() override {}    // Called before overlay wants to change from visible to invisible state
+    virtual void onShow() override {}
+    virtual void onHide() override {}
 
     virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
-        return initially<MainGui>();  // Initial Gui to load. It's possible to pass arguments to it's constructor like this
+        return initially<MainGui>();
     }
 };
 

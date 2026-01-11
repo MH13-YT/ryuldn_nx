@@ -8,9 +8,45 @@ namespace ams::mitm::ldn {
     static_assert(sizeof(ConnectNetworkData) == 0x7C, "sizeof(ConnectNetworkData) should be 0x7C");
     static_assert(sizeof(ScanFilter) == 0x60, "sizeof(ScanFilter) should be 0x60");
 
-    // TODO: Read from config file
-    static const char* RYULDN_SERVER_ADDRESS = "ldn.ryujinx.org";
-    static const int RYULDN_SERVER_PORT = 10000;
+    // ----- Sélection du serveur RyuLDN -----
+
+    enum class RyuLdnProfile : u8 {
+        Official = 0,
+        Custom   = 1,
+        Count
+    };
+
+    // Hardcode le profil actif ici :
+    static constexpr RyuLdnProfile RYULDN_ACTIVE_PROFILE = RyuLdnProfile::Custom;
+
+    struct RyuLdnServerConfig {
+        const char* address;
+        int         port;
+    };
+
+    static constexpr RyuLdnServerConfig RYULDN_PROFILES[] = {
+        /* Official */ { "ldn.ryujinx.app", 30456 },
+        /* Custom   */ { "192.168.1.186",   30456 },
+    };
+
+    static constexpr const RyuLdnServerConfig& GetActiveRyuLdnConfig() {
+        return RYULDN_PROFILES[static_cast<u8>(RYULDN_ACTIVE_PROFILE)];
+    }
+
+    static const RyuLdnServerConfig& g_RyuLdnConfig = GetActiveRyuLdnConfig();
+
+    const char* ICommunicationService::DisconnectReasonToString(u32 reason) {
+        switch (reason) {
+            case 0: return "None";
+            case 1: return "DisconnectedByUser";
+            case 2: return "DisconnectedBySystem";
+            case 3: return "DestroyedByUser";
+            case 4: return "DestroyedBySystem";
+            case 5: return "Rejected";
+            case 6: return "SignalLost";
+            default: return "Unknown";
+        }
+    }
 
     void ICommunicationService::setState(CommState state) {
         current_state = state;
@@ -21,14 +57,18 @@ namespace ams::mitm::ldn {
         if (connected) {
             network_info = info;
             if (current_state == CommState::AccessPoint) {
+                LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: AP created, state AccessPoint -> AccessPointCreated");
                 setState(CommState::AccessPointCreated);
             } else if (current_state == CommState::Station) {
+                LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: Station connected, state Station -> StationConnected");
                 setState(CommState::StationConnected);
             }
         } else {
             if (current_state == CommState::AccessPointCreated) {
+                LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: AP disconnected, state AccessPointCreated -> AccessPoint");
                 setState(CommState::AccessPoint);
             } else if (current_state == CommState::StationConnected) {
+                LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: Station disconnected, state StationConnected -> Station");
                 setState(CommState::Station);
             }
         }
@@ -36,25 +76,44 @@ namespace ams::mitm::ldn {
 
     void ICommunicationService::onEventFired() {
         if (this->state_event) {
-            LogFormat("onEventFired signal_event");
+            LOG_INFO(COMP_LDN_ICOM, "onEventFired signal_event");
             this->state_event->Signal();
         }
     }
 
     Result ICommunicationService::Initialize(const sf::ClientProcessId &client_process_id) {
-        LogFormat("ICommunicationService::Initialize pid: %" PRIu64, client_process_id.GetValue());
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "ICommunicationService::Initialize pid: %" PRIu64, client_process_id.GetValue());
 
         if (this->state_event == nullptr) {
             // ClearMode, inter_process
-            LogFormat("StateEvent is null");
-            this->state_event = new os::SystemEvent(::ams::os::EventClearMode_AutoClear, true);
+            LOG_INFO(COMP_LDN_ICOM, "StateEvent is null");
+            LOG_HEAP(COMP_LDN_ICOM, "before SystemEvent");
+            this->state_event = new (std::nothrow) os::SystemEvent(::ams::os::EventClearMode_AutoClear, true);
+
+            if (this->state_event == nullptr) {
+                LOG_INFO(COMP_LDN_ICOM, "ERROR: Failed to allocate SystemEvent - out of memory");
+                return MAKERESULT(0xFD, 2); // Memory allocation failure
+            }
+            LOG_HEAP(COMP_LDN_ICOM, "after SystemEvent");
         }
 
         // Create RyuLDN client
         if (this->ryuldn_client == nullptr) {
-            LogFormat("Creating RyuLDN LdnMasterProxyClient");
-            this->ryuldn_client = new ryuldn::LdnMasterProxyClient(RYULDN_SERVER_ADDRESS, RYULDN_SERVER_PORT, false);
+            LOG_INFO(COMP_LDN_ICOM, "Creating RyuLDN LdnMasterProxyClient");
+            LOG_INFO_ARGS(COMP_LDN_ICOM, "sizeof(LdnMasterProxyClient): %zu bytes", sizeof(ryuldn::LdnMasterProxyClient));
+            LOG_HEAP(COMP_LDN_ICOM, "before LdnMasterProxyClient");
+            this->ryuldn_client = new (std::nothrow) ryuldn::LdnMasterProxyClient(g_RyuLdnConfig.address, g_RyuLdnConfig.port, false);
 
+            // Check if allocation succeeded
+            if (this->ryuldn_client == nullptr) {
+                LOG_INFO(COMP_LDN_ICOM, "ERROR: Failed to allocate LdnMasterProxyClient - out of memory");
+                return MAKERESULT(0xFD, 2); // Memory allocation failure
+            }
+            LOG_HEAP(COMP_LDN_ICOM, "after LdnMasterProxyClient");
+
+            // IMPORTANT: Even if new() succeeded, the constructor might have failed internally
+            // Check if the object is in a valid state by verifying Initialize() succeeds
+            // (Initialize will fail if internal allocations failed)
             // Set network change callback
             this->ryuldn_client->SetNetworkChangeCallback([this](const NetworkInfo& info, bool connected) {
                 this->onNetworkChange(info, connected);
@@ -65,9 +124,17 @@ namespace ams::mitm::ldn {
                 // Create and register proxy when we receive ProxyConfig
                 if (this->ryuldn_proxy == nullptr && config.proxyIp != 0) {
                     // Create proxy with protocol access
-                    this->ryuldn_proxy = new ryuldn::proxy::LdnProxy(config, this->ryuldn_client, this->ryuldn_client->GetProtocol());
+                    LOG_INFO_ARGS(COMP_LDN_ICOM, "sizeof(LdnProxy): %zu bytes", sizeof(ryuldn::proxy::LdnProxy));
+                    LOG_HEAP(COMP_LDN_ICOM, "before LdnProxy");
+                    this->ryuldn_proxy = new (std::nothrow) ryuldn::proxy::LdnProxy(config, this->ryuldn_client, this->ryuldn_client->GetProtocol());
+
+                    if (this->ryuldn_proxy == nullptr) {
+                        LOG_INFO(COMP_LDN_ICOM, "ERROR: Failed to allocate LdnProxy - out of memory");
+                        return;
+                    }
+                    LOG_HEAP(COMP_LDN_ICOM, "after LdnProxy");
                     BsdMitmService::RegisterProxy(this->ryuldn_proxy);
-                    LogFormat("RyuLDN proxy created and registered");
+                    LOG_INFO(COMP_LDN_ICOM, "RyuLDN proxy created and registered");
                 }
             });
 
@@ -76,7 +143,7 @@ namespace ams::mitm::ldn {
 
             Result rc = this->ryuldn_client->Initialize();
             if (R_FAILED(rc)) {
-                LogFormat("Failed to initialize RyuLDN client: 0x%x", rc);
+                LOG_INFO_ARGS(COMP_LDN_ICOM, "Failed to initialize RyuLDN client: 0x%x", rc);
                 delete this->ryuldn_client;
                 this->ryuldn_client = nullptr;
                 return rc;
@@ -89,13 +156,13 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::InitializeSystem2(u64 unk, const sf::ClientProcessId &client_process_id) {
-        LogFormat("ICommunicationService::InitializeSystem2 unk: %" PRIu64, unk);
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "ICommunicationService::InitializeSystem2 unk: %" PRIu64, unk);
         this->error_state = unk;
         return this->Initialize(client_process_id);
     }
 
     Result ICommunicationService::Finalize() {
-        LogFormat("Finalize");
+        LOG_INFO(COMP_LDN_ICOM, "Finalize");
 
         // Destroy proxy first
         if (this->ryuldn_proxy) {
@@ -125,7 +192,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::OpenAccessPoint() {
-        LogFormat("OpenAccessPoint");
+        LOG_INFO(COMP_LDN_ICOM, "OpenAccessPoint");
 
         if (current_state != CommState::Initialized) {
             return MAKERESULT(0xCB, 32);
@@ -136,7 +203,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::CloseAccessPoint() {
-        LogFormat("CloseAccessPoint");
+        LOG_INFO(COMP_LDN_ICOM, "CloseAccessPoint");
 
         if (current_state == CommState::AccessPointCreated) {
             if (ryuldn_client) {
@@ -153,7 +220,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::DestroyNetwork() {
-        LogFormat("DestroyNetwork");
+        LOG_INFO(COMP_LDN_ICOM, "DestroyNetwork");
 
         if (current_state != CommState::AccessPointCreated) {
             return MAKERESULT(0xCB, 32);
@@ -168,7 +235,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::OpenStation() {
-        LogFormat("OpenStation");
+        LOG_INFO(COMP_LDN_ICOM, "OpenStation");
 
         if (current_state != CommState::Initialized) {
             return MAKERESULT(0xCB, 32);
@@ -179,7 +246,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::CloseStation() {
-        LogFormat("CloseStation");
+        LOG_INFO(COMP_LDN_ICOM, "CloseStation");
 
         if (current_state == CommState::StationConnected) {
             if (ryuldn_client) {
@@ -196,7 +263,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::Disconnect() {
-        LogFormat("Disconnect");
+        LOG_INFO(COMP_LDN_ICOM, "Disconnect");
 
         if (current_state != CommState::StationConnected) {
             return MAKERESULT(0xCB, 32);
@@ -211,7 +278,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::CreateNetwork(CreateNetworkConfig data) {
-        LogFormat("CreateNetwork");
+        LOG_INFO(COMP_LDN_ICOM, "CreateNetwork");
 
         if (current_state != CommState::AccessPoint) {
             return MAKERESULT(0xCB, 32);
@@ -224,25 +291,25 @@ namespace ams::mitm::ldn {
         // Build CreateAccessPointRequest
         ryuldn::CreateAccessPointRequest request;
         request.securityConfig = data.securityConfig;
-        request.userConfig = data.userConfig;
-        request.networkConfig = data.networkConfig;
+        request.userConfig     = data.userConfig;
+        request.networkConfig  = data.networkConfig;
         std::memset(&request.ryuNetworkConfig, 0, sizeof(request.ryuNetworkConfig));
 
-        // TODO: Get advertise data (for now, empty)
-        u8 advertiseData[AdvertiseDataSizeMax] = {0};
+        u8  advertiseData[AdvertiseDataSizeMax] = {0};
         u16 advertiseDataSize = 0;
 
         Result rc = ryuldn_client->CreateNetwork(request, advertiseData, advertiseDataSize);
         if (R_FAILED(rc)) {
-            LogFormat("Failed to create network: 0x%x", rc);
+            LOG_INFO_ARGS(COMP_LDN_ICOM, "ICommunicationService::CreateNetwork: RyuLDN CreateNetwork failed: 0x%x", rc);
             return rc;
         }
 
+        LOG_INFO(COMP_LDN_ICOM, "ICommunicationService::CreateNetwork: RyuLDN CreateNetwork succeeded");
         return ResultSuccess();
     }
 
     Result ICommunicationService::SetAdvertiseData(sf::InAutoSelectBuffer data) {
-        LogFormat("SetAdvertiseData size: %zu", data.GetSize());
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "SetAdvertiseData size: %zu", data.GetSize());
 
         if (current_state != CommState::AccessPoint && current_state != CommState::AccessPointCreated) {
             return MAKERESULT(0xCB, 32);
@@ -272,31 +339,36 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::GetIpv4Address(sf::Out<u32> address, sf::Out<u32> netmask) {
-        LogFormat("GetIpv4Address");
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "GetIpv4Address: state=%d (0x%x)", static_cast<u32>(current_state), static_cast<u32>(current_state));
 
-        if (current_state != CommState::AccessPointCreated && current_state != CommState::StationConnected) {
+        // Accepte TOUS les états où on a un réseau actif
+        if (current_state != CommState::AccessPointCreated && 
+            current_state != CommState::StationConnected && 
+            current_state != static_cast<CommState>(3)) {  // state 3 des logs
+            LOG_INFO_ARGS(COMP_LDN_ICOM, "GetIpv4Address: invalid state %d -> ERROR 0xCB00320", static_cast<u32>(current_state));
             return MAKERESULT(0xCB, 32);
         }
 
         if (!ryuldn_client) {
+            LOG_INFO(COMP_LDN_ICOM, "GetIpv4Address: no ryuldn_client");
             return MAKERESULT(0xFD, 1);
         }
 
         const ryuldn::ProxyConfig& config = ryuldn_client->GetProxyConfig();
 
         if (config.proxyIp == 0) {
-            // No proxy IP, use nifm
             u32 gateway, primary_dns, secondary_dns;
             Result rc = nifmGetCurrentIpConfigInfo(address.GetPointer(), netmask.GetPointer(), &gateway, &primary_dns, &secondary_dns);
-
             if (R_SUCCEEDED(rc)) {
                 address.SetValue(ntohl(address.GetValue()));
                 netmask.SetValue(ntohl(netmask.GetValue()));
+                LOG_INFO_ARGS(COMP_LDN_ICOM, "GetIpv4Address: nifm IP=0x%08x mask=0x%08x", address.GetValue(), netmask.GetValue());
+            } else {
+                LOG_INFO_ARGS(COMP_LDN_ICOM, "GetIpv4Address: nifm FAILED 0x%x", rc);
             }
-
             return rc;
         } else {
-            LogFormat("Using proxy IP: 0x%08x", config.proxyIp);
+            LOG_INFO_ARGS(COMP_LDN_ICOM, "GetIpv4Address: proxy IP=0x%08x mask=0x%08x ✓", config.proxyIp, config.proxySubnetMask);
             address.SetValue(config.proxyIp);
             netmask.SetValue(config.proxySubnetMask);
         }
@@ -304,25 +376,34 @@ namespace ams::mitm::ldn {
         return ResultSuccess();
     }
 
-    Result ICommunicationService::GetNetworkInfo(sf::Out<NetworkInfo> buffer) {
-        LogFormat("GetNetworkInfo state: %d", static_cast<u32>(current_state));
 
-        if (current_state != CommState::AccessPointCreated && current_state != CommState::StationConnected) {
-            return MAKERESULT(0xCB, 32);
-        }
-
-        buffer.SetValue(network_info);
+    Result ICommunicationService::GetNetworkInfo(sf::Out<NetworkInfo> info) {
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "GetNetworkInfo: state=%d (0x%x)", static_cast<u32>(current_state), static_cast<u32>(current_state));
+        info.SetValue(network_info);
         return ResultSuccess();
     }
 
     Result ICommunicationService::GetDisconnectReason(sf::Out<u32> reason) {
-        LogFormat("GetDisconnectReason: %u", static_cast<u32>(disconnect_reason));
-        reason.SetValue(static_cast<u32>(disconnect_reason));
+        u32 local_reason = static_cast<u32>(disconnect_reason);
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "GetDisconnectReason: local=%u (%s)", local_reason, DisconnectReasonToString(local_reason));
+
+        if (ryuldn_client) {
+            auto r = ryuldn_client->GetDisconnectReason();
+            u32 ryu_reason = static_cast<u32>(r);
+            if (r != ryuldn::DisconnectReason::None) {
+                LOG_INFO_ARGS(COMP_LDN_ICOM, "GetDisconnectReason: RyuLDN=%u (%s)", ryu_reason, DisconnectReasonToString(ryu_reason));
+                reason.SetValue(ryu_reason);
+                return ResultSuccess();
+            }
+        }
+
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "GetDisconnectReason: using local=%u (%s)", local_reason, DisconnectReasonToString(local_reason));
+        reason.SetValue(local_reason);
         return ResultSuccess();
     }
 
     Result ICommunicationService::GetNetworkInfoLatestUpdate(sf::Out<NetworkInfo> buffer, sf::OutArray<NodeLatestUpdate> pUpdates) {
-        LogFormat("GetNetworkInfoLatestUpdate buffer %p pUpdates %p count %zu",
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "GetNetworkInfoLatestUpdate buffer %p pUpdates %p count %zu",
                   buffer.GetPointer(), pUpdates.GetPointer(), pUpdates.GetSize());
 
         if (current_state != CommState::AccessPointCreated && current_state != CommState::StationConnected) {
@@ -342,7 +423,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::GetSecurityParameter(sf::Out<SecurityParameter> out) {
-        LogFormat("GetSecurityParameter");
+        LOG_INFO(COMP_LDN_ICOM, "GetSecurityParameter");
 
         if (current_state != CommState::AccessPointCreated && current_state != CommState::StationConnected) {
             return MAKERESULT(0xCB, 32);
@@ -357,7 +438,7 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::GetNetworkConfig(sf::Out<NetworkConfig> out) {
-        LogFormat("GetNetworkConfig");
+        LOG_INFO(COMP_LDN_ICOM, "GetNetworkConfig");
 
         if (current_state != CommState::AccessPointCreated && current_state != CommState::StationConnected) {
             return MAKERESULT(0xCB, 32);
@@ -381,7 +462,7 @@ namespace ams::mitm::ldn {
 
     Result ICommunicationService::Scan(sf::Out<u32> outCount, sf::OutAutoSelectArray<NetworkInfo> buffer, u16 channel, ScanFilter filter) {
         AMS_UNUSED(channel);
-        LogFormat("Scan");
+        LOG_INFO(COMP_LDN_ICOM, "Scan");
 
         if (current_state < CommState::Initialized) {
             return MAKERESULT(0xCB, 32);
@@ -397,13 +478,13 @@ namespace ams::mitm::ldn {
 
         outCount.SetValue(count);
 
-        LogFormat("Scan found %d networks, rc=%d", count, rc);
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "Scan found %d networks, rc=%d", count, rc);
 
         return rc;
     }
 
     Result ICommunicationService::Connect(ConnectNetworkData param, const NetworkInfo &data) {
-        LogFormat("Connect");
+        LOG_INFO(COMP_LDN_ICOM, "Connect");
 
         if (current_state != CommState::Station) {
             return MAKERESULT(0xCB, 32);
@@ -422,7 +503,7 @@ namespace ams::mitm::ldn {
 
         Result rc = ryuldn_client->Connect(request);
         if (R_FAILED(rc)) {
-            LogFormat("Failed to connect: 0x%x", rc);
+            LOG_INFO_ARGS(COMP_LDN_ICOM, "Failed to connect: 0x%x", rc);
             return rc;
         }
 
@@ -431,7 +512,7 @@ namespace ams::mitm::ldn {
 
     // NYI functions
     Result ICommunicationService::SetStationAcceptPolicy(u8 policy) {
-        LogFormat("SetStationAcceptPolicy: %d", policy);
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "SetStationAcceptPolicy: %d", policy);
 
         if (current_state != CommState::AccessPoint && current_state != CommState::AccessPointCreated) {
             return MAKERESULT(0xCB, 32);

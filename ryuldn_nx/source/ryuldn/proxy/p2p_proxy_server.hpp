@@ -56,6 +56,10 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         std::list<P2pProxySession*> _players;
         os::Mutex _playersLock;
 
+        // Shared packet buffer to avoid stack overflow
+        std::unique_ptr<u8[]> _packetBuffer;
+        os::Mutex _packetBufferMutex;
+
         // Authentication tokens
         std::vector<ExternalProxyToken> _waitingTokens;
         os::Mutex _tokensLock;

@@ -3,6 +3,7 @@
 #include "../ldn_master_proxy_client.hpp"
 #include "../ryu_ldn_protocol.hpp"
 #include "../../debug.hpp"
+
 #include <arpa/inet.h>
 #include <cstring>
 #include <algorithm>
@@ -13,18 +14,24 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         : _parent(client),
           _protocol(protocol),
           _socketsMutex(false),
+          _packetBufferMutex(false),
           _subnetMask(config.proxySubnetMask),
           _localIp(config.proxyIp),
           _broadcast(_localIp | (~_subnetMask))
     {
+        LOG_HEAP(COMP_RLDN_PROXY,"LdnProxy constructor start");
         // Initialize ephemeral port pools for each protocol (using piecewise_construct)
         // Initialize ephemeral port pools for each protocol (using make_unique)
         _ephemeralPorts[IPPROTO_UDP] = std::make_unique<EphemeralPortPool>();
         _ephemeralPorts[IPPROTO_TCP] = std::make_unique<EphemeralPortPool>();
 
+        // Allocate shared packet buffer
+        _packetBuffer = std::make_unique<u8[]>(MaxPacketSize);
+
         RegisterHandlers(protocol);
 
-        LogFormat("LdnProxy created: IP=0x%08x, Mask=0x%08x, Broadcast=0x%08x", _localIp, _subnetMask, _broadcast);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy created: IP=0x%08x, Mask=0x%08x, Broadcast=0x%08x", _localIp, _subnetMask, _broadcast);
+        LOG_HEAP(COMP_RLDN_PROXY,"LdnProxy constructor end");
     }
 
     LdnProxy::~LdnProxy() {
@@ -61,7 +68,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
     bool LdnProxy::Supported(s32 domain, [[maybe_unused]] s32 type, s32 protocol) {
         if (protocol == IPPROTO_TCP) {
-            LogFormat("LdnProxy: TCP proxy networking is untested");
+            LOG_INFO(COMP_RLDN_PROXY,"LdnProxy: TCP proxy networking is untested");
         }
 
         return domain == AF_INET && (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP);
@@ -85,13 +92,13 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     void LdnProxy::RegisterSocket(LdnProxySocket* socket) {
         std::scoped_lock lk(_socketsMutex);
         _sockets.push_back(socket);
-        LogFormat("LdnProxy: Socket registered (total: %zu)", _sockets.size());
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: Socket registered (total: %zu)", _sockets.size());
     }
 
     void LdnProxy::UnregisterSocket(LdnProxySocket* socket) {
         std::scoped_lock lk(_socketsMutex);
         _sockets.remove(socket);
-        LogFormat("LdnProxy: Socket unregistered (total: %zu)", _sockets.size());
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: Socket unregistered (total: %zu)", _sockets.size());
     }
 
     void LdnProxy::ForRoutedSockets(const ProxyInfo& info, std::function<void(LdnProxySocket*)> action) {
@@ -169,12 +176,13 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         ProxyConnectRequestFull request;
         request.info = MakeInfo(localEp, remoteEp, protocolType);
 
-        u8 packet[MaxPacketSize];
+        std::scoped_lock lock(_packetBufferMutex);
+        u8* packet = _packetBuffer.get();
         int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnect, request, packet);
 
         _parent->SendRawPacket(packet, packetSize);
 
-        LogFormat("LdnProxy: RequestConnection from %08x:%u to %08x:%u (proto %d)",
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: RequestConnection from %08x:%u to %08x:%u (proto %d)",
                  request.info.sourceIpV4, request.info.sourcePort,
                  request.info.destIpV4, request.info.destPort,
                  protocolType);
@@ -185,12 +193,13 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         ProxyConnectResponseFull response;
         response.info = MakeInfo(localEp, remoteEp, protocolType);
 
-        u8 packet[MaxPacketSize];
+        std::scoped_lock lock(_packetBufferMutex);
+        u8* packet = _packetBuffer.get();
         int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnectReply, response, packet);
 
         _parent->SendRawPacket(packet, packetSize);
 
-        LogFormat("LdnProxy: SignalConnected from %08x:%u to %08x:%u",
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: SignalConnected from %08x:%u to %08x:%u",
                  response.info.sourceIpV4, response.info.sourcePort,
                  response.info.destIpV4, response.info.destPort);
     }
@@ -201,12 +210,13 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         message.info = MakeInfo(localEp, remoteEp, protocolType);
         message.reason = DisconnectReason::None; // TODO: proper disconnect reason
 
-        u8 packet[MaxPacketSize];
+        std::scoped_lock lock(_packetBufferMutex);
+        u8* packet = _packetBuffer.get();
         int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyDisconnect, message, packet);
 
         _parent->SendRawPacket(packet, packetSize);
 
-        LogFormat("LdnProxy: EndConnection from %08x:%u to %08x:%u",
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: EndConnection from %08x:%u to %08x:%u",
                  message.info.sourceIpV4, message.info.sourcePort,
                  message.info.destIpV4, message.info.destPort);
     }
@@ -220,12 +230,13 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         header.info = MakeInfo(localEp, remoteEp, protocolType);
         header.dataLength = bufferSize;
 
-        u8 packet[MaxPacketSize];
+        std::scoped_lock lock(_packetBufferMutex);
+        u8* packet = _packetBuffer.get();
         int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyData, header, buffer, bufferSize, packet);
 
         _parent->SendRawPacket(packet, packetSize);
 
-        LogFormat("LdnProxy: SendTo %zu bytes from %08x:%u to %08x:%u",
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: SendTo %zu bytes from %08x:%u to %08x:%u",
                  bufferSize,
                  header.info.sourceIpV4, header.info.sourcePort,
                  header.info.destIpV4, header.info.destPort);
@@ -237,7 +248,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     s32 LdnProxy::SendTo(s32 fd, const u8* buffer, size_t bufferSize, const sockaddr_in* dest) {
         // For now, just log and return success
         // TODO: Implement proper socket tracking with file descriptors
-        LogFormat("LdnProxy::SendTo(fd=%d): Compatibility method called, size=%zu", fd, bufferSize);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy::SendTo(fd=%d): Compatibility method called, size=%zu", fd, bufferSize);
 
         // Create dummy local endpoint
         sockaddr_in localEp;
@@ -252,7 +263,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     Result LdnProxy::RecvFrom(s32 fd, [[maybe_unused]] u8* buffer, [[maybe_unused]] size_t bufferSize, size_t* received, [[maybe_unused]] sockaddr_in* from) {
         // For now, just log and return failure (would block)
         // TODO: Implement proper socket tracking with file descriptors
-        LogFormat("LdnProxy::RecvFrom(fd=%d): Compatibility method called", fd);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy::RecvFrom(fd=%d): Compatibility method called", fd);
         if (received) {
             *received = 0;
         }
@@ -262,7 +273,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     void LdnProxy::CleanupSocket(s32 fd) {
         // For now, just log
         // TODO: Implement proper socket tracking with file descriptors
-        LogFormat("LdnProxy::CleanupSocket(fd=%d): Compatibility method called", fd);
+        LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy::CleanupSocket(fd=%d): Compatibility method called", fd);
     }
 
     void LdnProxy::Dispose() {
@@ -275,7 +286,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // as it doesn't exist in our C++ implementation
         _sockets.clear();
 
-        LogFormat("LdnProxy: Disposed");
+        LOG_INFO(COMP_RLDN_PROXY,"LdnProxy: Disposed");
     }
 
 } // namespace ams::mitm::ldn::ryuldn::proxy

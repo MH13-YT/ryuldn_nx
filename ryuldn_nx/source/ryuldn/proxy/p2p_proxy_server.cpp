@@ -19,10 +19,12 @@ namespace ams::mitm::ldn::ryuldn::proxy {
           _master(master),
           _masterProtocol(masterProtocol),
           _playersLock(false),
+          _packetBufferMutex(false),
           _tokensLock(false),
           _tokenEvent(os::EventClearMode_ManualClear, true),
           _leaseThreadRunning(false)
     {
+        LOG_HEAP(COMP_RLDN_P2P_SRV, "P2pProxyServer constructor start");
         // Register handlers with master protocol
         _masterProtocol->onExternalProxyToken = [this](const LdnHeader& header, const ExternalProxyToken& token) {
             HandleToken(header, token);
@@ -32,7 +34,11 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             HandleStateChange(header, state);
         };
 
-        LogFormat("P2pProxyServer: Created on port %u", _privatePort);
+        // Allocate shared packet buffer
+        _packetBuffer = std::make_unique<u8[]>(MaxPacketSize);
+
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Created on port %u", _privatePort);
+        LOG_HEAP(COMP_RLDN_P2P_SRV, "P2pProxyServer constructor end");
     }
 
     P2pProxyServer::~P2pProxyServer() {
@@ -47,7 +53,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Create listen socket
         _listenSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (_listenSocket < 0) {
-            LogFormat("P2pProxyServer: Failed to create listen socket");
+            LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to create listen socket");
             return false;
         }
 
@@ -63,7 +69,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         addr.sin_port = htons(_privatePort);
 
         if (bind(_listenSocket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-            LogFormat("P2pProxyServer: Failed to bind to port %u", _privatePort);
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to bind to port %u", _privatePort);
             close(_listenSocket);
             _listenSocket = -1;
             return false;
@@ -71,20 +77,29 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         // Listen
         if (listen(_listenSocket, 10) < 0) {
-            LogFormat("P2pProxyServer: Failed to listen");
+            LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to listen");
             close(_listenSocket);
             _listenSocket = -1;
             return false;
         }
 
         // Allocate accept thread stack
+        LOG_HEAP(COMP_RLDN_P2P_SRV, "before P2pProxyServer accept thread stack");
         _acceptThreadStack = std::make_unique<u8[]>(AcceptThreadStackSize + os::ThreadStackAlignment);
+        if (!_acceptThreadStack) {
+            LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to allocate accept thread stack");
+            LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxyServer accept thread stack FAILED");
+            close(_listenSocket);
+            _listenSocket = -1;
+            return false;
+        }
+        LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxyServer accept thread stack");
         void* acceptStackTop = reinterpret_cast<void*>(util::AlignUp(reinterpret_cast<uintptr_t>(_acceptThreadStack.get()), os::ThreadStackAlignment));
 
         // Create accept thread
         Result rc = os::CreateThread(&_acceptThread, AcceptThreadFunc, this, acceptStackTop, AcceptThreadStackSize, 0x2C, 3);
         if (R_FAILED(rc)) {
-            LogFormat("P2pProxyServer: Failed to create accept thread: 0x%x", rc);
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to create accept thread: 0x%x", rc);
             close(_listenSocket);
             _listenSocket = -1;
             return false;
@@ -93,7 +108,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         _running = true;
         os::StartThread(&_acceptThread);
 
-        LogFormat("P2pProxyServer: Started on port %u", _privatePort);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Started on port %u", _privatePort);
         return true;
     }
 
@@ -132,7 +147,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             os::DestroyThread(&_leaseThread);
         }
 
-        LogFormat("P2pProxyServer: Stopped");
+        LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Stopped");
     }
 
     void P2pProxyServer::Dispose() {
@@ -155,22 +170,22 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _masterProtocol->onExternalProxyState = nullptr;
         }
 
-        LogFormat("P2pProxyServer: Disposed");
+        LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Disposed");
     }
 
     void P2pProxyServer::Configure(const ProxyConfig& config) {
         _broadcastAddress = config.proxyIp | (~config.proxySubnetMask);
-        LogFormat("P2pProxyServer: Configured broadcast=0x%08x", _broadcastAddress);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Configured broadcast=0x%08x", _broadcastAddress);
     }
 
     u16 P2pProxyServer::NatPunch() {
         // Discover UPnP device
         if (!_upnpClient.DiscoverDevice()) {
-            LogFormat("P2pProxyServer: UPnP device not found");
+            LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: UPnP device not found");
             return 0;
         }
 
-        LogFormat("P2pProxyServer: UPnP device discovered");
+        LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: UPnP device discovered");
 
         // Try to create port mapping with different public ports
         _publicPort = PublicPortBase;
@@ -186,7 +201,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
             if (_upnpClient.CreatePortMapping(_portMapping)) {
                 _hasPortMapping = true;
-                LogFormat("P2pProxyServer: Port mapping created %u -> %u", _privatePort, _publicPort);
+                LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Port mapping created %u -> %u", _privatePort, _publicPort);
 
                 // Start lease renewal thread
                 _leaseThreadStack = std::make_unique<u8[]>(LeaseThreadStackSize + os::ThreadStackAlignment);
@@ -204,7 +219,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             _publicPort++;
         }
 
-        LogFormat("P2pProxyServer: Failed to create port mapping");
+        LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to create port mapping");
         _publicPort = 0;
         return 0;
     }
@@ -223,22 +238,31 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
             if (clientSocket < 0) {
                 if (_running) {
-                    LogFormat("P2pProxyServer: Accept error: %d", errno);
+                    LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Accept error: %d", errno);
                 }
                 break;
             }
 
             // Create new session
-            P2pProxySession* session = new P2pProxySession(this, clientSocket);
+            LOG_HEAP(COMP_RLDN_P2P_SRV, "before P2pProxySession");
+            P2pProxySession* session = new (std::nothrow) P2pProxySession(this, clientSocket);
+            if (session == nullptr) {
+                LOG_INFO(COMP_RLDN_P2P_SRV, "ERROR: Failed to allocate P2pProxySession - out of memory");
+                LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxySession FAILED");
+                close(clientSocket);
+                continue;
+            }
+            LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxySession");
+
             if (!session->Start()) {
-                LogFormat("P2pProxyServer: Failed to start session");
+                LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to start session");
                 delete session;
                 continue;
             }
 
             char ipStr[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, sizeof(ipStr));
-            LogFormat("P2pProxyServer: Client connected from %s:%u", ipStr, ntohs(clientAddr.sin_port));
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Client connected from %s:%u", ipStr, ntohs(clientAddr.sin_port));
         }
     }
 
@@ -258,7 +282,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
             // Refresh lease
             if (!RefreshLease()) {
-                LogFormat("P2pProxyServer: Failed to refresh port mapping lease");
+                LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to refresh port mapping lease");
             }
         }
     }
@@ -269,7 +293,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         }
 
         if (_upnpClient.CreatePortMapping(_portMapping)) {
-            LogFormat("P2pProxyServer: Port mapping lease renewed");
+            LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Port mapping lease renewed");
             return true;
         }
 
@@ -281,12 +305,12 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         _waitingTokens.push_back(token);
         os::SignalSystemEvent(_tokenEvent.GetBase());
 
-        LogFormat("P2pProxyServer: Token received for virtual IP 0x%08x", token.virtualIp);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Token received for virtual IP 0x%08x", token.virtualIp);
     }
 
     void P2pProxyServer::HandleStateChange([[maybe_unused]] const LdnHeader& header, const ExternalProxyConnectionState& state) {
         if (!state.connected) {
-            LogFormat("P2pProxyServer: State change - disconnecting 0x%08x", state.ipAddress);
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: State change - disconnecting 0x%08x", state.ipAddress);
 
             // Remove waiting tokens for this IP
             {
@@ -327,7 +351,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             info.sourceIpV4 = sender->GetVirtualIpAddress();
         } else if (info.sourceIpV4 != sender->GetVirtualIpAddress()) {
             // Can't pretend to be somebody else
-            LogFormat("P2pProxyServer: Rejected spoofed packet from 0x%08x claiming to be 0x%08x",
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Rejected spoofed packet from 0x%08x claiming to be 0x%08x",
                      sender->GetVirtualIpAddress(), info.sourceIpV4);
             return;
         }
@@ -362,7 +386,8 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     void P2pProxyServer::HandleProxyDisconnect(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyDisconnectMessageFull& message) {
         ProxyDisconnectMessageFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            u8 packet[MaxPacketSize];
+            std::scoped_lock lock(_packetBufferMutex);
+            u8* packet = _packetBuffer.get();
             int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyDisconnect, msg, packet);
             target->SendAsync(packet, packetSize);
         });
@@ -371,7 +396,8 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     void P2pProxyServer::HandleProxyData(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyDataHeaderFull& message, const u8* data, u32 dataSize) {
         ProxyDataHeaderFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            u8 packet[MaxPacketSize];
+            std::scoped_lock lock(_packetBufferMutex);
+            u8* packet = _packetBuffer.get();
             int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyData, msg, data, dataSize, packet);
             target->SendAsync(packet, packetSize);
         });
@@ -380,7 +406,8 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     void P2pProxyServer::HandleProxyConnectReply(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyConnectResponseFull& message) {
         ProxyConnectResponseFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            u8 packet[MaxPacketSize];
+            std::scoped_lock lock(_packetBufferMutex);
+            u8* packet = _packetBuffer.get();
             int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnectReply, msg, packet);
             target->SendAsync(packet, packetSize);
         });
@@ -389,7 +416,8 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     void P2pProxyServer::HandleProxyConnect(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyConnectRequestFull& message) {
         ProxyConnectRequestFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            u8 packet[MaxPacketSize];
+            std::scoped_lock lock(_packetBufferMutex);
+            u8* packet = _packetBuffer.get();
             int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnect, msg, packet);
             target->SendAsync(packet, packetSize);
         });
@@ -400,7 +428,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         sockaddr_in clientAddr;
         socklen_t addrLen = sizeof(clientAddr);
         if (getpeername(session->GetSocket(), reinterpret_cast<sockaddr*>(&clientAddr), &addrLen) < 0) {
-            LogFormat("P2pProxyServer: Failed to get client address");
+            LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to get client address");
             return false;
         }
 
@@ -459,11 +487,12 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                     }
 
                     // Send proxy config to client
-                    u8 packet[MaxPacketSize];
+                    std::scoped_lock lock(_packetBufferMutex);
+            u8* packet = _packetBuffer.get();
                     int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConfig, pconfig, packet);
                     session->SendAsync(packet, packetSize);
 
-                    LogFormat("P2pProxyServer: User registered with virtual IP 0x%08x", waitToken.virtualIp);
+                    LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: User registered with virtual IP 0x%08x", waitToken.virtualIp);
                     return true;
                 }
             }
@@ -486,7 +515,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         } while (true);
 
-        LogFormat("P2pProxyServer: User registration failed - no matching token");
+        LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: User registration failed - no matching token");
         return false;
     }
 
@@ -508,11 +537,12 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             state.ipAddress = session->GetVirtualIpAddress();
             state.connected = false;
 
-            u8 packet[MaxPacketSize];
+            std::scoped_lock lock(_packetBufferMutex);
+            u8* packet = _packetBuffer.get();
             int packetSize = RyuLdnProtocol::Encode(PacketId::ExternalProxyState, state, packet);
             _master->SendRawPacket(packet, packetSize);
 
-            LogFormat("P2pProxyServer: Client disconnected (virtual IP 0x%08x)", session->GetVirtualIpAddress());
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Client disconnected (virtual IP 0x%08x)", session->GetVirtualIpAddress());
         }
     }
 

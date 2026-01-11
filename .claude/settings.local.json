@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo:*)",
+      "Bash(/c/devkitpro/devkitA64/bin/aarch64-none-elf-gdb.exe:*)",
+      "Bash(timeout 10 /c/devkitpro/devkitA64/bin/aarch64-none-elf-gdb.exe:*)",
+      "Bash(ls:*)",
+      "Bash(make:*)",
+      "Bash(/c/devkitpro/msys2/usr/bin/make)",
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(done)"
+    ]
+  }
+}

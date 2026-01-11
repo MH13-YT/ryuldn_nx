@@ -1,11 +1,11 @@
 #pragma once
-// LDN Master Proxy Client
-// Matches Ryujinx LdnRyu/LdnMasterProxyClient.cs
+
 #include "ryu_ldn_protocol.hpp"
 #include "network_timeout.hpp"
 #include "types.hpp"
 #include "proxy/p2p_proxy_server.hpp"
 #include "proxy/p2p_proxy_client.hpp"
+
 #include <stratosphere.hpp>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -18,18 +18,15 @@
 
 namespace ams::mitm::ldn::ryuldn {
 
-    // Callback for network changes (not defined in protocol.hpp)
+    // Callback pour les changements de réseau (correspond à la V1)
     using NetworkChangeCallback = std::function<void(const NetworkInfo&, bool)>;
-    // Note: ProxyConfigCallback and ProxyDataCallback are already defined in ryu_ldn_protocol.hpp
 
-    // Forward declarations
+    // Forward declarations comme dans la V1
     namespace proxy {
         class P2pProxyServer;
         class P2pProxyClient;
     }
 
-    // Main RyuLDN client for connecting to master server
-    // Matches Ryujinx LdnRyu/LdnMasterProxyClient.cs
     class LdnMasterProxyClient {
     private:
         std::string _serverAddress;
@@ -45,6 +42,11 @@ namespace ams::mitm::ldn::ryuldn {
         std::unique_ptr<u8[]> _threadStack;
         static constexpr size_t ThreadStackSize = 0x8000;
 
+        // Shared packet buffer
+        std::unique_ptr<u8[]> _packetBuffer;
+        os::Mutex _packetBufferMutex;
+
+        // Événements rétablis en pointeurs bruts (non RAII)
         os::SystemEvent* _connectedEvent;
         os::SystemEvent* _errorEvent;
         os::SystemEvent* _scanEvent;
@@ -52,10 +54,12 @@ namespace ams::mitm::ldn::ryuldn {
         os::SystemEvent* _apConnectedEvent;
 
         RyuLdnProtocol _protocol;
+        std::unique_ptr<NetworkTimeout> _timeout;
 
         std::vector<NetworkInfo> _availableGames;
         DisconnectReason _disconnectReason;
         NetworkError _lastError;
+        NetworkInfo _lastNetworkInfo;
 
         InitializeMessage _initializeMemory;
         ProxyConfig _config;
@@ -63,7 +67,7 @@ namespace ams::mitm::ldn::ryuldn {
         u8 _gameVersion[0x10];
         std::string _passphrase;
 
-        // P2P Proxy support
+        // Proxies rétablis en pointeurs bruts (non RAII)
         proxy::P2pProxyServer* _hostedProxy;
         proxy::P2pProxyClient* _connectedProxy;
 
@@ -74,18 +78,21 @@ namespace ams::mitm::ldn::ryuldn {
         ProxyConfigCallback _proxyConfigCallback;
         ProxyDataCallback _proxyDataCallback;
 
-        // Private methods
+        // Méthodes privées
         static void WorkerThreadFunc(void* arg);
         void WorkerLoop();
 
         bool EnsureConnected();
         void Disconnect();
         void DisconnectInternal();
+        void TimeoutConnection();
 
         int SendPacket(const u8* data, int size);
         int ReceiveData();
 
         void UpdatePassphraseIfNeeded(const char* passphrase);
+        void ConfigureAccessPoint(RyuNetworkConfig& config);
+        void DisconnectProxy();
 
         // Protocol event handlers
         void HandleInitialize(const LdnHeader& header, const InitializeMessage& msg);
@@ -130,7 +137,7 @@ namespace ams::mitm::ldn::ryuldn {
         Result SetStationAcceptPolicy(u8 acceptPolicy);
         Result Reject(DisconnectReason reason, u32 nodeId);
 
-        // Raw packet sending (for proxy)
+        // Raw packet sending (Déplacé en PUBLIC pour correspondre à la V1)
         int SendRawPacket(const u8* data, int size);
 
         // Getters
