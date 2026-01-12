@@ -467,4 +467,136 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         return !_errors.empty();
     }
 
+    // BSD-compatible wrappers
+    int LdnProxySocket::BsdAccept(sockaddr* addr, socklen_t* addrlen) {
+        if (!_isListening) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        LdnProxySocket* accepted_socket = nullptr;
+        Accept(&accepted_socket);
+        if (accepted_socket) {
+            // Fill in the address info
+            if (addr && addrlen) {
+                sockaddr_in remote = accepted_socket->GetRemoteEndPoint();
+                size_t copy_size = std::min(static_cast<size_t>(*addrlen), sizeof(sockaddr_in));
+                std::memcpy(addr, &remote, copy_size);
+                *addrlen = sizeof(sockaddr_in);
+            }
+            
+            // Return a fake fd (we'll handle the mapping in BsdMitmService)
+            // For now, just return a positive value to indicate success
+            errno = 0;
+            return 1; // Placeholder, real fd should be assigned by caller
+        }
+        errno = EAGAIN;
+        return -1;
+    }
+
+    int LdnProxySocket::BsdGetSocketOption(int level, int optname, void* optval, socklen_t* optlen) {
+        (void)level; // Unused parameter
+        
+        if (!optval || !optlen) {
+            errno = EFAULT;
+            return -1;
+        }
+
+        // Map BSD socket options to our SocketOptionName
+        SocketOptionName mapped_opt;
+        switch (optname) {
+            case SO_BROADCAST: mapped_opt = SocketOptionName::Broadcast; break;
+            case SO_DEBUG: mapped_opt = SocketOptionName::Debug; break;
+            case SO_KEEPALIVE: mapped_opt = SocketOptionName::KeepAlive; break;
+            case SO_RCVBUF: mapped_opt = SocketOptionName::ReceiveBuffer; break;
+            case SO_RCVTIMEO: mapped_opt = SocketOptionName::ReceiveTimeout; break;
+            case SO_SNDBUF: mapped_opt = SocketOptionName::SendBuffer; break;
+            case SO_SNDTIMEO: mapped_opt = SocketOptionName::SendTimeout; break;
+            case SO_TYPE: mapped_opt = SocketOptionName::Type; break;
+            case SO_REUSEADDR: mapped_opt = SocketOptionName::ReuseAddress; break;
+            case SO_ERROR: mapped_opt = SocketOptionName::Error; break;
+            default:
+                errno = ENOPROTOOPT;
+                return -1;
+        }
+
+        s32 value = GetSocketOption(mapped_opt);
+        
+        // Copy to output buffer
+        if (*optlen >= sizeof(s32)) {
+            *reinterpret_cast<s32*>(optval) = value;
+            *optlen = sizeof(s32);
+            errno = 0;
+            return 0;
+        } else {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    int LdnProxySocket::BsdSetSocketOption(int level, int optname, const void* optval, socklen_t optlen) {
+        (void)level; // Unused parameter
+        
+        if (!optval || optlen < sizeof(s32)) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        s32 value = *reinterpret_cast<const s32*>(optval);
+
+        // Map BSD socket options to our SocketOptionName
+        SocketOptionName mapped_opt;
+        switch (optname) {
+            case SO_BROADCAST: mapped_opt = SocketOptionName::Broadcast; break;
+            case SO_DEBUG: mapped_opt = SocketOptionName::Debug; break;
+            case SO_KEEPALIVE: mapped_opt = SocketOptionName::KeepAlive; break;
+            case SO_RCVBUF: mapped_opt = SocketOptionName::ReceiveBuffer; break;
+            case SO_RCVTIMEO: mapped_opt = SocketOptionName::ReceiveTimeout; break;
+            case SO_SNDBUF: mapped_opt = SocketOptionName::SendBuffer; break;
+            case SO_SNDTIMEO: mapped_opt = SocketOptionName::SendTimeout; break;
+            case SO_REUSEADDR: mapped_opt = SocketOptionName::ReuseAddress; break;
+            default:
+                errno = ENOPROTOOPT;
+                return -1;
+        }
+
+        SetSocketOption(mapped_opt, value);
+        errno = 0;
+        return 0;
+    }
+
+    int LdnProxySocket::BsdListen(int backlog) {
+        Listen(static_cast<s32>(backlog));
+        errno = 0;
+        return 0;
+    }
+
+    int LdnProxySocket::BsdShutdown(int how) {
+        Shutdown(static_cast<s32>(how));
+        errno = 0;
+        return 0;
+    }
+
+    int LdnProxySocket::BsdFcntl(int cmd, int flags) {
+        // Handle F_GETFL and F_SETFL for O_NONBLOCK
+        const int F_GETFL = 3;
+        const int F_SETFL = 4;
+        const int O_NONBLOCK = 0x0004;
+
+        switch (cmd) {
+            case F_GETFL:
+                errno = 0;
+                return _blocking ? 0 : O_NONBLOCK;
+                
+            case F_SETFL:
+                _blocking = !(flags & O_NONBLOCK);
+                errno = 0;
+                return 0;
+                
+            default:
+                errno = EINVAL;
+                return -1;
+        }
+    }
+
 } // namespace ams::mitm::ldn::ryuldn::proxy

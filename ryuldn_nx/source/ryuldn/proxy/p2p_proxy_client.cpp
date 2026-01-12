@@ -198,6 +198,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     bool P2pProxyClient::PerformAuth(const ExternalProxyConfig& config) {
         // Wait for connection
         TimeSpan timeout = TimeSpan::FromMilliSeconds(FailureTimeoutMs);
+        os::ClearSystemEvent(_connectedEvent.GetBase());
         if (!os::TimedWaitSystemEvent(_connectedEvent.GetBase(), timeout)) {
             LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Connection timeout");
             return false;
@@ -228,6 +229,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
     bool P2pProxyClient::EnsureProxyReady() {
         TimeSpan timeout = TimeSpan::FromMilliSeconds(FailureTimeoutMs);
+        os::ClearSystemEvent(_readyEvent.GetBase());
         if (!os::TimedWaitSystemEvent(_readyEvent.GetBase(), timeout)) {
             LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Proxy ready timeout");
             return false;

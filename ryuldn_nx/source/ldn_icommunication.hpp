@@ -56,18 +56,8 @@ namespace ams::mitm::ldn {
 
             ~ICommunicationService() {
                 LOG_INFO(COMP_LDN_ICOM, "~ICommunicationService");  // ✅ Corrigé
-                if (this->state_event != nullptr) {
-                    delete this->state_event;
-                    this->state_event = nullptr;
-                }
-                if (this->ryuldn_proxy != nullptr) {
-                    delete this->ryuldn_proxy;
-                    this->ryuldn_proxy = nullptr;
-                }
-                if (this->ryuldn_client != nullptr) {
-                    delete this->ryuldn_client;
-                    this->ryuldn_client = nullptr;
-                }
+                // Ensure Finalize() is called to properly stop all worker threads and clean up resources
+                static_cast<void>(Finalize());
             };
 
         private:

@@ -140,17 +140,36 @@ void LdnMasterProxyClient::WorkerThreadFunc(void* arg) {
 
 void LdnMasterProxyClient::WorkerLoop() {
     while (!_stop) {
-        if (_connected && ReceiveData() < 0) {
-            Disconnect();
-            _events.errorEvent.Signal();
+        if (_connected && _socket >= 0) {
+            // Use poll() to wait for data with 100ms timeout instead of busy-waiting
+            struct pollfd pfd = {_socket, POLLIN, 0};
+            int pollRet = ::poll(&pfd, 1, 100);
+            
+            if (pollRet > 0 && (pfd.revents & POLLIN)) {
+                // Data is available, receive it
+                if (ReceiveData() < 0) {
+                    Disconnect();
+                    _events.errorEvent.Signal();
+                }
+            } else if (pollRet < 0) {
+                // Poll error
+                int err = errno;
+                if (err != EINTR) {
+                    LOG_ERR_ARGS(COMP_RLDN_MASTER,"WorkerLoop: poll() failed with errno=%d", err);
+                    Disconnect();
+                    _events.errorEvent.Signal();
+                }
+            }
+            // pollRet == 0 means timeout, just continue to next iteration
+        } else {
+            // Not connected, just sleep a bit
+            os::SleepThread(TimeSpan::FromMilliSeconds(100));
         }
         
         // Check for timeouts periodically
         if (_timeout) {
             _timeout->CheckTimeout();
         }
-        
-        os::SleepThread(TimeSpan::FromMilliSeconds(10));
     }
 }
 
@@ -259,6 +278,11 @@ bool LdnMasterProxyClient::EnsureConnected() {
         }
     }
 
+    // IMPORTANT: Clear event BEFORE sending to avoid race condition
+    // If response arrives before TimedWait(), it would timeout
+    LOG_DBG(COMP_RLDN_MASTER," [EVENT-TRACE] Clearing initializeEvent BEFORE sending packet");
+    _events.initializeEvent.Clear();
+
     int sent = SendPacket(buffer.Get(), size);
     LOG_DBG_ARGS(COMP_RLDN_MASTER," SendPacket returned: %d (expected %d)", sent, size);
     if (sent != size) {
@@ -269,8 +293,6 @@ bool LdnMasterProxyClient::EnsureConnected() {
 
     // Wait for Initialize response from server (processed by WorkerLoop thread)
     LOG_DBG(COMP_RLDN_MASTER," Waiting for Initialize response from server...");
-    LOG_DBG(COMP_RLDN_MASTER," [EVENT-TRACE] Clearing initializeEvent before wait");
-    _events.initializeEvent.Clear();
     LOG_DBG(COMP_RLDN_MASTER," [EVENT-TRACE] Starting TimedWait (5000ms) on initializeEvent");
     
     if (!_events.initializeEvent.TimedWait(TimeSpan::FromMilliSeconds(5000))) {
@@ -309,10 +331,6 @@ void LdnMasterProxyClient::DisconnectInternal() {
 }
 
 int LdnMasterProxyClient::SendPacket(const u8* data, int size) {
-    if (!_connected || _socket < 0) {
-        LOG_ERR_ARGS(COMP_RLDN_MASTER,"SendPacket: Not connected (_connected=%d, _socket=%d)", _connected, _socket);
-        return -1;
-    }
     LOG_DBG_ARGS(COMP_RLDN_MASTER," SendPacket: Sending %d bytes", size);
     
     // Hex dump header + up to 64 bytes (always logs the header bytes even if packet is larger)
@@ -327,6 +345,13 @@ int LdnMasterProxyClient::SendPacket(const u8* data, int size) {
     }
     
     std::lock_guard<std::mutex> lock(_sendMutex);
+    
+    // Check connection state AFTER acquiring lock to avoid TOCTOU race
+    if (!_connected || _socket < 0) {
+        LOG_ERR_ARGS(COMP_RLDN_MASTER,"SendPacket: Not connected (_connected=%d, _socket=%d)", _connected, _socket);
+        return -1;
+    }
+    
     int sent = 0;
     while (sent < size) {
         int rc = ::send(_socket, data + sent, size - sent, 0);
@@ -354,22 +379,20 @@ int LdnMasterProxyClient::SendPacket(const u8* data, int size) {
 int LdnMasterProxyClient::SendRawPacket(const u8* data, int size) { return SendPacket(data, size); }
 
 int LdnMasterProxyClient::ReceiveData() {
+    // Protect socket read to prevent multiple concurrent recv() calls
+    std::lock_guard<std::mutex> lock(_receiveMutex);
+    
+    // Check connection state AFTER acquiring lock to avoid TOCTOU race
     if (!_connected || _socket < 0) {
         LOG_ERR_ARGS(COMP_RLDN_MASTER,"ReceiveData: Not connected (_connected=%d, _socket=%d)", _connected, _socket);
         return -1;
     }
     
-    // Protect socket read to prevent multiple concurrent recv() calls
-    std::lock_guard<std::mutex> lock(_receiveMutex);
-    
     u8 buffer[4096];
-    int received = ::recv(_socket, buffer, sizeof(buffer), MSG_DONTWAIT);
+    // NOTE: poll() in WorkerLoop ensures data is available, so use blocking recv()
+    int received = ::recv(_socket, buffer, sizeof(buffer), 0);
     if (received < 0) {
         int err = errno;
-        if (err == EAGAIN || err == EWOULDBLOCK) {
-            LOG_DBG_ARGS(COMP_RLDN_MASTER," ReceiveData: EAGAIN/EWOULDBLOCK (errno=%d)", err);
-            return 0;
-        }
         LOG_ERR_ARGS(COMP_RLDN_MASTER,"ReceiveData: recv() failed, errno=%d", err);
         return -1;
     }
@@ -551,6 +574,10 @@ Result LdnMasterProxyClient::CreateNetwork(const CreateAccessPointRequest& req, 
         return MAKERESULT(0xFD, 1);
     }
     int sz = RyuLdnProtocol::Encode(PacketId::CreateAccessPoint, mod, d, s, buffer.Get());
+    
+    // Clear event BEFORE sending packet to avoid race condition
+    _events.apConnectedEvent.Clear();
+    
     SendPacket(buffer.Get(), sz);
     
     if (_events.apConnectedEvent.TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) {
@@ -635,6 +662,10 @@ Result LdnMasterProxyClient::Connect(const ConnectRequest& req) {
     ScopedBuffer buffer(g_sharedBufferPool);
     if (!buffer.Get()) return MAKERESULT(0xFD, 1);
     int sz = RyuLdnProtocol::Encode(PacketId::Connect, req, buffer.Get());
+    
+    // Clear event BEFORE sending packet to avoid race condition
+    _events.apConnectedEvent.Clear();
+    
     SendPacket(buffer.Get(), sz);
     if (_events.apConnectedEvent.TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) {
         LOG_INFO(COMP_RLDN_MASTER,"Connect: Successfully connected to network");
@@ -767,6 +798,10 @@ Result LdnMasterProxyClient::CreateNetworkPrivate(const CreateAccessPointPrivate
     ScopedBuffer buffer(g_sharedBufferPool);
     if (!buffer.Get()) return MAKERESULT(0xFD, 1);
     int sz = RyuLdnProtocol::Encode(PacketId::CreateAccessPointPrivate, req, d, s, buffer.Get());
+    
+    // Clear event BEFORE sending packet to avoid race condition
+    _events.apConnectedEvent.Clear();
+    
     SendPacket(buffer.Get(), sz);
     if (_events.apConnectedEvent.TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) return ResultSuccess();
     return MAKERESULT(0xFD, 2);
@@ -781,6 +816,10 @@ Result LdnMasterProxyClient::ConnectPrivate(const ConnectPrivateRequest& req) {
     ScopedBuffer buffer(g_sharedBufferPool);
     if (!buffer.Get()) return MAKERESULT(0xFD, 1);
     int sz = RyuLdnProtocol::Encode(PacketId::ConnectPrivate, req, buffer.Get());
+    
+    // Clear event BEFORE sending packet to avoid race condition
+    _events.apConnectedEvent.Clear();
+    
     SendPacket(buffer.Get(), sz);
     if (_events.apConnectedEvent.TimedWait(TimeSpan::FromMilliSeconds(FailureTimeout))) return ResultSuccess();
     return MAKERESULT(0xFD, 2);

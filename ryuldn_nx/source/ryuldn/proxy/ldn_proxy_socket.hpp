@@ -132,6 +132,14 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         void HandleConnectResponse(const ProxyConnectResponseFull& response);
         void HandleDisconnect(const ProxyDisconnectMessageFull& msg);
 
+        // BSD-compatible wrappers (return -1 on error, set errno)
+        int BsdAccept(sockaddr* addr, socklen_t* addrlen);
+        int BsdGetSocketOption(int level, int optname, void* optval, socklen_t* optlen);
+        int BsdSetSocketOption(int level, int optname, const void* optval, socklen_t optlen);
+        int BsdListen(int backlog);
+        int BsdShutdown(int how);
+        int BsdFcntl(int cmd, int flags);
+
         // Properties
         bool IsConnected() const { return _connected; }
         bool IsBound() const { return _isBound; }

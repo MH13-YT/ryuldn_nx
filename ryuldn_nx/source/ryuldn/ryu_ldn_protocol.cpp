@@ -17,6 +17,8 @@ namespace ams::mitm::ldn::ryuldn {
         // Thread-safe read operation (defensive programming)
         std::lock_guard<os::Mutex> lock(_readMutex);
         
+        LOG_DBG_ARGS(COMP_RLDN_PROTOCOL," Read: Processing %d bytes (offset=%d)", size, offset);
+        
         int index = 0;
 
         while (index < size) {
@@ -28,8 +30,11 @@ namespace ams::mitm::ldn::ryuldn {
                 index += copyable;
                 _headerBytesReceived += copyable;
                 
-                // Continue to next iteration to check if header is complete
-                continue;
+                // If header is not yet complete, continue to next iteration
+                if (_headerBytesReceived < HeaderSize) {
+                    continue;
+                }
+                // Header is complete, fall through to Phase 2 to process it
             }
 
             // Phase 2: Header complete - validate and borrow buffer if needed
@@ -55,6 +60,15 @@ namespace ams::mitm::ldn::ryuldn {
                     LOG_INFO_ARGS(COMP_RLDN_PROTOCOL, "RyuLdnProtocol: Packet too large (%d bytes)", header.dataSize);
                     Reset();
                     return;
+                }
+
+                // Special case: dataSize=0 means no payload, handle immediately
+                if (header.dataSize == 0) {
+                    LOG_DBG_ARGS(COMP_RLDN_PROTOCOL,"  Packet complete (no payload) at index=%d, calling DecodeAndHandle", index);
+                    DecodeAndHandle(header, nullptr);
+                    _headerBytesReceived = 0;
+                    LOG_DBG_ARGS(COMP_RLDN_PROTOCOL,"  Reset state (no payload), continuing to index=%d (size=%d)", index, size);
+                    continue;
                 }
 
                 // Borrow buffer for packet data
@@ -87,6 +101,7 @@ namespace ams::mitm::ldn::ryuldn {
 
                 // Phase 4: Packet complete - decode and handle
                 if (_bufferEnd >= finalSize) {
+                    LOG_DBG_ARGS(COMP_RLDN_PROTOCOL,"  Packet complete at index=%d, calling DecodeAndHandle", index);
                     DecodeAndHandle(header, _currentBuffer);
                     
                     // Return buffer immediately
@@ -97,14 +112,19 @@ namespace ams::mitm::ldn::ryuldn {
                     _headerBytesReceived = 0;
                     _bufferEnd = 0;
                     _inPacket = false;
+                    LOG_DBG_ARGS(COMP_RLDN_PROTOCOL,"  Reset state, continuing to index=%d (size=%d)", index, size);
                 }
             }
         }
+        LOG_DBG_ARGS(COMP_RLDN_PROTOCOL," Read: Finished processing, index=%d size=%d", index, size);
     }
 
     void RyuLdnProtocol::DecodeAndHandle(const LdnHeader& header, const u8* data) {
+        LOG_DBG_ARGS(COMP_RLDN_PROTOCOL," DecodeAndHandle: PacketId=%d, dataSize=%u", header.type, header.dataSize);
+        
         switch (static_cast<PacketId>(header.type)) {
             case PacketId::Initialize:
+                LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling Initialize");
                 if (onInitialize) {
                     InitializeMessage msg;
                     ParseStruct(data, msg);
@@ -113,6 +133,7 @@ namespace ams::mitm::ldn::ryuldn {
                 break;
 
             case PacketId::Passphrase:
+                LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling Passphrase");
                 if (onPassphrase) {
                     PassphraseMessage msg;
                     ParseStruct(data, msg);
@@ -121,6 +142,7 @@ namespace ams::mitm::ldn::ryuldn {
                 break;
 
             case PacketId::Connected:
+                LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling Connected");
                 if (onConnected) {
                     NetworkInfo info;
                     ParseStruct(data, info);
@@ -129,6 +151,7 @@ namespace ams::mitm::ldn::ryuldn {
                 break;
 
             case PacketId::SyncNetwork:
+                LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling SyncNetwork");
                 if (onSyncNetwork) {
                     NetworkInfo info;
                     ParseStruct(data, info);
@@ -137,6 +160,7 @@ namespace ams::mitm::ldn::ryuldn {
                 break;
 
             case PacketId::ScanReply:
+                LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling ScanReply");
                 if (onScanReply) {
                     NetworkInfo info;
                     ParseStruct(data, info);
@@ -145,6 +169,7 @@ namespace ams::mitm::ldn::ryuldn {
                 break;
 
             case PacketId::ScanReplyEnd:
+                LOG_INFO(COMP_RLDN_PROTOCOL," -> Handling ScanReplyEnd - should signal scanEvent");
                 if (onScanReplyEnd) {
                     onScanReplyEnd(header);
                 }
