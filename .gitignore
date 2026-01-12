@@ -81,6 +81,3 @@ make.bat
 
 debug_logs/
 .claude/
-gdb/
-debug.bat
-debug.sh
