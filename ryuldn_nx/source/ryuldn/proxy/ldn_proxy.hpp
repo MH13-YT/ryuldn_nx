@@ -33,10 +33,6 @@ namespace ams::mitm::ldn::ryuldn {
 
             std::unordered_map<s32, std::unique_ptr<EphemeralPortPool>> _ephemeralPorts; // keyed by protocol type
 
-            // Shared packet buffer to avoid stack overflow
-            std::unique_ptr<u8[]> _packetBuffer;
-            os::Mutex _packetBufferMutex;
-
             u32 _subnetMask;
             u32 _localIp;
             u32 _broadcast;

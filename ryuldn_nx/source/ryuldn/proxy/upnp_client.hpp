@@ -50,6 +50,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         std::string _controlUrl;
         bool _discovered;
 
+        // Track last HTTP status to allow callers to fast-fail on hard errors (e.g. 404)
+        int _lastHttpStatus;
+
         s32 _socket;
         os::Mutex _mutex;
 
@@ -79,6 +82,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         // Check if device was discovered
         bool IsDiscovered() const { return _discovered; }
+
+        // Last HTTP status for the most recent SOAP request (0 if none)
+        int GetLastHttpStatus() const { return _lastHttpStatus; }
 
         // Get gateway URL
         const std::string& GetGatewayUrl() const { return _gatewayUrl; }

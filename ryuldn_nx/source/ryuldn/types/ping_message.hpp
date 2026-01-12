@@ -3,11 +3,12 @@
 
 namespace ams::mitm::ldn::ryuldn {
 
-    // Ping/Pong message
+    // Ping/Pong message (2 bytes)
     // Matches Ryujinx LdnRyu/Types/PingMessage.cs
     struct PingMessage {
-        u32 requester;      // 0 = server request, 1 = client request
-        u32 timestamp;      // Timestamp for RTT calculation
+        u8 requester;   // 0 = server request, 1 = client request
+        u8 id;          // Ping identifier
     } __attribute__((packed));
+    static_assert(sizeof(PingMessage) == 0x2, "PingMessage must be 0x2 bytes");
 
 }

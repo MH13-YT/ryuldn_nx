@@ -17,9 +17,9 @@
 #include "ldn_client_process_monitor.hpp"
 
 namespace ams::mitm::ldn {
-    Result IClientProcessMonitor::RegisterClient([[maybe_unused]] const sf::ClientProcessId &client_process_id) {
-    // Stub pour firmware 18.0.0+ - Pokemon Legends Z-A
-    LOG_DBG(COMP_LDN_MONITOR, "ClientProcessId registered (stub)");
-    return ResultSuccess();
-}
+        Result IClientProcessMonitor::RegisterClient([[maybe_unused]] const sf::ClientProcessId &client_process_id) {
+        // Stub pour firmware 18.0.0+ - Pokemon Legends Z-A
+        LOG_DBG(COMP_LDN_MONITOR, "ClientProcessId registered (stub)");
+        return ResultSuccess();
+    }
 }

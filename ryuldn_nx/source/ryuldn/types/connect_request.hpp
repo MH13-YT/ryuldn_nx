@@ -26,5 +26,6 @@ namespace ams::mitm::ldn::ryuldn {
         u32 optionUnknown;
         NetworkConfig networkConfig;
     } __attribute__((packed));
+    static_assert(sizeof(ConnectPrivateRequest) == 0xBC, "ConnectPrivateRequest must be 0xBC bytes");
 
 }

@@ -4,10 +4,10 @@
 
 namespace ams::mitm::ldn::ryuldn {
 
-    // Network error notification message
+    // Network error notification message (4 bytes)
     struct NetworkErrorMessage {
         NetworkError error;
-        u8 padding[3];
     } __attribute__((packed));
+    static_assert(sizeof(NetworkErrorMessage) == 0x4, "NetworkErrorMessage must be 0x4 bytes");
 
 }

@@ -1,39 +1,44 @@
 #include "ldn_icommunication.hpp"
 #include "bsd_mitm_service.hpp"
+#include "ryuldnnx_config.hpp"
 #include <arpa/inet.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+
+// Explicitly use global ams namespace to avoid ambiguity with nested ams from macro
+using namespace ::ams;
+
+namespace {
+    using namespace ams::mitm::ldn;
+
+    constexpr int kDefaultPort = 30456;
+    constexpr const char* kDefaultHost = "ldn.ryujinx.app";
+
+    // Get server address from in-memory config
+    inline std::string GetServerAddress() {
+        const char* server_ip = LdnConfig::GetServerIP();
+        if (server_ip != nullptr && std::strlen(server_ip) > 0) {
+            return std::string(server_ip);
+        }
+        return std::string(kDefaultHost);
+    }
+
+    // Get server port from in-memory config
+    inline int GetServerPort() {
+        u16 port = LdnConfig::GetServerPort();
+        return (port > 0) ? port : kDefaultPort;
+    }
+
+} // anonymous namespace
 
 namespace ams::mitm::ldn {
     static_assert(sizeof(NetworkInfo) == 0x480, "sizeof(NetworkInfo) should be 0x480");
     static_assert(sizeof(ConnectNetworkData) == 0x7C, "sizeof(ConnectNetworkData) should be 0x7C");
     static_assert(sizeof(ScanFilter) == 0x60, "sizeof(ScanFilter) should be 0x60");
-
-    // ----- Sélection du serveur RyuLDN -----
-
-    enum class RyuLdnProfile : u8 {
-        Official = 0,
-        Custom   = 1,
-        Count
-    };
-
-    // Hardcode le profil actif ici :
-    static constexpr RyuLdnProfile RYULDN_ACTIVE_PROFILE = RyuLdnProfile::Custom;
-
-    struct RyuLdnServerConfig {
-        const char* address;
-        int         port;
-    };
-
-    static constexpr RyuLdnServerConfig RYULDN_PROFILES[] = {
-        /* Official */ { "ldn.ryujinx.app", 30456 },
-        /* Custom   */ { "192.168.1.186",   30456 },
-    };
-
-    static constexpr const RyuLdnServerConfig& GetActiveRyuLdnConfig() {
-        return RYULDN_PROFILES[static_cast<u8>(RYULDN_ACTIVE_PROFILE)];
-    }
-
-    static const RyuLdnServerConfig& g_RyuLdnConfig = GetActiveRyuLdnConfig();
 
     const char* ICommunicationService::DisconnectReasonToString(u32 reason) {
         switch (reason) {
@@ -53,9 +58,12 @@ namespace ams::mitm::ldn {
         onEventFired();
     }
 
-    void ICommunicationService::onNetworkChange(const NetworkInfo& info, bool connected) {
+    void ICommunicationService::onNetworkChange(const NetworkInfo& info, bool connected, ryuldn::DisconnectReason reason) {
         if (connected) {
+            disconnect_reason = ryuldn::DisconnectReason::None;
+            disconnect_ip = 0;
             network_info = info;
+
             if (current_state == CommState::AccessPoint) {
                 LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: AP created, state AccessPoint -> AccessPointCreated");
                 setState(CommState::AccessPointCreated);
@@ -63,14 +71,32 @@ namespace ams::mitm::ldn {
                 LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: Station connected, state Station -> StationConnected");
                 setState(CommState::StationConnected);
             }
-        } else {
+            return;
+        }
+
+        // Disconnection path
+        ryuldn::DisconnectReason effective_reason = reason;
+
+        if (effective_reason == ryuldn::DisconnectReason::None) {
             if (current_state == CommState::AccessPointCreated) {
-                LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: AP disconnected, state AccessPointCreated -> AccessPoint");
-                setState(CommState::AccessPoint);
+                effective_reason = ryuldn::DisconnectReason::DestroyedBySystem;
             } else if (current_state == CommState::StationConnected) {
-                LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: Station disconnected, state StationConnected -> Station");
-                setState(CommState::Station);
+                effective_reason = ryuldn::DisconnectReason::DisconnectedByUser;
+            } else {
+                effective_reason = ryuldn::DisconnectReason::DisconnectedBySystem;
             }
+        }
+
+        disconnect_reason = effective_reason;
+        disconnect_ip = ryuldn_client ? ryuldn_client->GetDisconnectIp() : 0;
+        network_info = info;
+
+        if (current_state == CommState::AccessPointCreated) {
+            LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: AP disconnected, state AccessPointCreated -> AccessPoint");
+            setState(CommState::AccessPoint);
+        } else if (current_state == CommState::StationConnected) {
+            LOG_INFO(COMP_LDN_ICOM, "onNetworkChange: Station disconnected, state StationConnected -> Station");
+            setState(CommState::Station);
         }
     }
 
@@ -97,15 +123,26 @@ namespace ams::mitm::ldn {
             LOG_HEAP(COMP_LDN_ICOM, "after SystemEvent");
         }
 
-        // Create RyuLDN client
+        // Get server config from in-memory LdnConfig (already loaded at system startup)
+        const std::string server_address = ::GetServerAddress();
+        const int server_port = ::GetServerPort();
+        const bool use_p2p_proxy = true; // P2P enabled by default (force_master_relay = false)
+        
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "LDN Session starting with server: %s:%d", server_address.c_str(), server_port);
+        
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "RyuLDN server: %s:%d (force_master_relay=%d)", server_address.c_str(), server_port, !use_p2p_proxy);
         if (this->ryuldn_client == nullptr) {
             LOG_INFO(COMP_LDN_ICOM, "Creating RyuLDN LdnMasterProxyClient");
             LOG_INFO_ARGS(COMP_LDN_ICOM, "sizeof(LdnMasterProxyClient): %zu bytes", sizeof(ryuldn::LdnMasterProxyClient));
             LOG_HEAP(COMP_LDN_ICOM, "before LdnMasterProxyClient");
-            this->ryuldn_client = new (std::nothrow) ryuldn::LdnMasterProxyClient(g_RyuLdnConfig.address, g_RyuLdnConfig.port, false);
+            this->ryuldn_client = new (std::nothrow) ryuldn::LdnMasterProxyClient(server_address.c_str(), server_port, use_p2p_proxy);
 
-            // Check if allocation succeeded
-            if (this->ryuldn_client == nullptr) {
+            // Check if allocation and construction succeeded
+            if (this->ryuldn_client == nullptr || !this->ryuldn_client->IsConstructionSuccessful()) {
+                if (this->ryuldn_client != nullptr) {
+                    delete this->ryuldn_client;
+                    this->ryuldn_client = nullptr;
+                }
                 LOG_INFO(COMP_LDN_ICOM, "ERROR: Failed to allocate LdnMasterProxyClient - out of memory");
                 return MAKERESULT(0xFD, 2); // Memory allocation failure
             }
@@ -115,8 +152,8 @@ namespace ams::mitm::ldn {
             // Check if the object is in a valid state by verifying Initialize() succeeds
             // (Initialize will fail if internal allocations failed)
             // Set network change callback
-            this->ryuldn_client->SetNetworkChangeCallback([this](const NetworkInfo& info, bool connected) {
-                this->onNetworkChange(info, connected);
+            this->ryuldn_client->SetNetworkChangeCallback([this](const NetworkInfo& info, bool connected, ryuldn::DisconnectReason reason) {
+                this->onNetworkChange(info, connected, reason);
             });
 
             // Set proxy config callback
@@ -148,6 +185,18 @@ namespace ams::mitm::ldn {
                 this->ryuldn_client = nullptr;
                 return rc;
             }
+
+                // Apply overlay-provided passphrase (runtime only, not persisted)
+                if (LdnConfig::getPassphraseIncluded() && LdnConfig::getPassphraseSize() > 0) {
+                    this->ryuldn_client->SetPassphrase(LdnConfig::getPassphrase());
+                }
+
+            // Register passphrase update handler for live overlay changes
+            LdnConfig::SetPassphraseUpdateHandler([this](const char* pass, u32 size) {
+                if (this->ryuldn_client && pass && size > 0 && LdnConfig::getPassphraseIncluded()) {
+                    this->ryuldn_client->SetPassphrase(pass);
+                }
+            });
         }
 
         setState(CommState::Initialized);
@@ -295,10 +344,35 @@ namespace ams::mitm::ldn {
         request.networkConfig  = data.networkConfig;
         std::memset(&request.ryuNetworkConfig, 0, sizeof(request.ryuNetworkConfig));
 
+        // Overlay control: optionally strip passphrase inclusion
+        if (!LdnConfig::getPassphraseIncluded()) {
+            request.securityConfig.passphraseSize = 0;
+            std::memset(request.securityConfig.passphrase, 0, sizeof(request.securityConfig.passphrase));
+        }
+
         u8  advertiseData[AdvertiseDataSizeMax] = {0};
         u16 advertiseDataSize = 0;
 
-        Result rc = ryuldn_client->CreateNetwork(request, advertiseData, advertiseDataSize);
+        Result rc;
+        if (request.securityConfig.passphraseSize > 0) {
+            // Ensure server sees the current passphrase
+            if (LdnConfig::getPassphraseIncluded() && LdnConfig::getPassphraseSize() > 0) {
+                ryuldn_client->SetPassphrase(LdnConfig::getPassphrase());
+            }
+            ryuldn::CreateAccessPointPrivateRequest priv{};
+            priv.securityConfig = request.securityConfig;
+            // Copy to aligned temporary to avoid packed member address warning
+            SecurityParameter secParam;
+            NetworkInfo2SecurityParameter(&network_info, &secParam);
+            priv.securityParameter = secParam;
+            priv.userConfig = request.userConfig;
+            priv.networkConfig = request.networkConfig;
+            std::memset(&priv.addressList, 0, sizeof(priv.addressList));
+            std::memset(&priv.ryuNetworkConfig, 0, sizeof(priv.ryuNetworkConfig));
+            rc = ryuldn_client->CreateNetworkPrivate(priv, advertiseData, advertiseDataSize);
+        } else {
+            rc = ryuldn_client->CreateNetwork(request, advertiseData, advertiseDataSize);
+        }
         if (R_FAILED(rc)) {
             LOG_INFO_ARGS(COMP_LDN_ICOM, "ICommunicationService::CreateNetwork: RyuLDN CreateNetwork failed: 0x%x", rc);
             return rc;
@@ -402,6 +476,16 @@ namespace ams::mitm::ldn {
         return ResultSuccess();
     }
 
+    Result ICommunicationService::GetDisconnectIp(sf::Out<u32> ip) {
+        u32 local_ip = disconnect_ip;
+        if (ryuldn_client) {
+            local_ip = ryuldn_client->GetDisconnectIp();
+        }
+        LOG_INFO_ARGS(COMP_LDN_ICOM, "GetDisconnectIp: 0x%08x", local_ip);
+        ip.SetValue(local_ip);
+        return ResultSuccess();
+    }
+
     Result ICommunicationService::GetNetworkInfoLatestUpdate(sf::Out<NetworkInfo> buffer, sf::OutArray<NodeLatestUpdate> pUpdates) {
         LOG_INFO_ARGS(COMP_LDN_ICOM, "GetNetworkInfoLatestUpdate buffer %p pUpdates %p count %zu",
                   buffer.GetPointer(), pUpdates.GetPointer(), pUpdates.GetSize());
@@ -494,14 +578,39 @@ namespace ams::mitm::ldn {
             return MAKERESULT(0xFD, 1);
         }
 
-        ryuldn::ConnectRequest request;
-        request.securityConfig = param.securityConfig;
-        request.userConfig = param.userConfig;
-        request.localCommunicationVersion = param.localCommunicationVersion;
-        request.optionUnknown = param.option;
-        request.networkInfo = data;
+        Result rc;
+        if (!LdnConfig::getPassphraseIncluded()) {
+            param.securityConfig.passphraseSize = 0;
+            std::memset(param.securityConfig.passphrase, 0, sizeof(param.securityConfig.passphrase));
+        }
 
-        Result rc = ryuldn_client->Connect(request);
+        if (param.securityConfig.passphraseSize > 0) {
+            // Ensure server sees the current passphrase
+            if (LdnConfig::getPassphraseSize() > 0) {
+                ryuldn_client->SetPassphrase(LdnConfig::getPassphrase());
+            }
+            ryuldn::ConnectPrivateRequest priv{};
+            priv.securityConfig = param.securityConfig;
+            // Copy to aligned temporaries to avoid packed member address warning
+            SecurityParameter secParam;
+            NetworkInfo2SecurityParameter(&network_info, &secParam);
+            priv.securityParameter = secParam;
+            priv.userConfig = param.userConfig;
+            priv.localCommunicationVersion = param.localCommunicationVersion;
+            priv.optionUnknown = param.option;
+            NetworkConfig netConfig;
+            NetworkInfo2NetworkConfig(const_cast<NetworkInfo*>(&data), &netConfig);
+            priv.networkConfig = netConfig;
+            rc = ryuldn_client->ConnectPrivate(priv);
+        } else {
+            ryuldn::ConnectRequest request;
+            request.securityConfig = param.securityConfig;
+            request.userConfig = param.userConfig;
+            request.localCommunicationVersion = param.localCommunicationVersion;
+            request.optionUnknown = param.option;
+            request.networkInfo = data;
+            rc = ryuldn_client->Connect(request);
+        }
         if (R_FAILED(rc)) {
             LOG_INFO_ARGS(COMP_LDN_ICOM, "Failed to connect: 0x%x", rc);
             return rc;

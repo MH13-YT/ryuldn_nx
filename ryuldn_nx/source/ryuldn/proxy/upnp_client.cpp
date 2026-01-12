@@ -7,10 +7,11 @@
 
 namespace ams::mitm::ldn::ryuldn::proxy {
 
-    UpnpClient::UpnpClient()
-        : _discovered(false),
-          _socket(-1),
-          _mutex(false)
+        UpnpClient::UpnpClient()
+                : _discovered(false),
+                    _lastHttpStatus(0),
+                    _socket(-1),
+                    _mutex(false)
     {
     }
 
@@ -130,19 +131,19 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             return false;
         }
 
-        // Wait for responses
-        char buffer[2048];
+        // Wait for responses - use heap to avoid stack overflow
+        std::unique_ptr<char[]> buffer(new char[2048]);
         sockaddr_in from;
         socklen_t fromLen = sizeof(from);
 
         for (int i = 0; i < 5; i++) { // Try up to 5 responses
-            ssize_t received = recvfrom(_socket, buffer, sizeof(buffer) - 1, 0,
+            ssize_t received = recvfrom(_socket, buffer.get(), 2048 - 1, 0,
                                        (struct sockaddr*)&from, &fromLen);
 
             if (received > 0) {
-                buffer[received] = '\0';
+                buffer.get()[received] = '\0';
 
-                if (ParseSsdpResponse(buffer, received)) {
+                if (ParseSsdpResponse(buffer.get(), received)) {
                     LOG_INFO(COMP_RLDN_UPNP,"Device discovered successfully");
                     return true;
                 }
@@ -158,6 +159,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     }
 
     bool UpnpClient::SendSoapRequest(const std::string& action, const std::string& body, std::string& response) {
+        // Reset last status at the start of every request
+        _lastHttpStatus = 0;
+
         // Parse control URL: http://host:port/path
         size_t protoEnd = _controlUrl.find("://");
         if (protoEnd == std::string::npos) {
@@ -226,10 +230,10 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             return false;
         }
 
-        // Build HTTP POST request
+        // Build HTTP POST request (use dynamic allocation to save stack space)
         std::string soapAction = "urn:schemas-upnp-org:service:WANIPConnection:1#" + action;
-        char httpRequest[4096];
-        snprintf(httpRequest, sizeof(httpRequest),
+        std::unique_ptr<char[]> httpRequest(new char[4096]);
+        snprintf(httpRequest.get(), 4096,
                 "POST %s HTTP/1.1\r\n"
                 "Host: %s:%d\r\n"
                 "Content-Type: text/xml; charset=\"utf-8\"\r\n"
@@ -246,16 +250,16 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                 body.c_str());
 
         // Send request
-        ssize_t sent = send(sock, httpRequest, strlen(httpRequest), 0);
+        ssize_t sent = send(sock, httpRequest.get(), strlen(httpRequest.get()), 0);
         if (sent < 0) {
             LOG_ERR(COMP_RLDN_UPNP,"Failed to send HTTP request");
             close(sock);
             return false;
         }
 
-        // Read response
-        char respBuffer[4096];
-        ssize_t received = recv(sock, respBuffer, sizeof(respBuffer) - 1, 0);
+        // Read response (use dynamic allocation to save stack space)
+        std::unique_ptr<char[]> respBuffer(new char[4096]);
+        ssize_t received = recv(sock, respBuffer.get(), 4095, 0);
         close(sock);
 
         if (received <= 0) {
@@ -264,15 +268,21 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         }
 
         respBuffer[received] = '\0';
-        response.assign(respBuffer, received);
+        response.assign(respBuffer.get(), received);
+
+        // Capture HTTP status for callers (e.g. 404 hard fail)
+        int statusCode = 0;
+        if (sscanf(respBuffer.get(), "HTTP/%*s %d", &statusCode) == 1) {
+            _lastHttpStatus = statusCode;
+        }
 
         // Check for HTTP 200 OK
-        if (strstr(respBuffer, "200 OK") != nullptr) {
+        if (strstr(respBuffer.get(), "200 OK") != nullptr) {
             LOG_INFO_ARGS(COMP_RLDN_UPNP,"%s successful", action.c_str());
             return true;
         }
 
-        LOG_INFO_ARGS(COMP_RLDN_UPNP,"%s failed - %s", action.c_str(), respBuffer);
+        LOG_INFO_ARGS(COMP_RLDN_UPNP,"%s failed - %s", action.c_str(), respBuffer.get());
         return false;
     }
 
@@ -298,9 +308,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         }
         LOG_INFO_ARGS(COMP_RLDN_UPNP,"Using local IP: %s", localIP.c_str());
 
-        // Build SOAP request body
-        char soapBody[1024];
-        snprintf(soapBody, sizeof(soapBody),
+        // Build SOAP request body - use heap to avoid stack overflow
+        std::unique_ptr<char[]> soapBody(new char[1024]);
+        snprintf(soapBody.get(), 1024,
                 "<?xml version=\"1.0\"?>"
                 "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
                 "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
@@ -325,7 +335,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                 mapping.leaseDuration);
 
         std::string response;
-        return SendSoapRequest("AddPortMapping", soapBody, response);
+        return SendSoapRequest("AddPortMapping", soapBody.get(), response);
     }
 
     bool UpnpClient::DeletePortMapping(const PortMapping& mapping) {
@@ -339,9 +349,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                  static_cast<int>(mapping.protocol),
                  mapping.publicPort);
 
-        // Build SOAP request (simplified)
-        char soapBody[512];
-        snprintf(soapBody, sizeof(soapBody),
+        // Build SOAP request (simplified) - use heap to avoid stack overflow
+        std::unique_ptr<char[]> soapBody(new char[512]);
+        snprintf(soapBody.get(), 512,
                 "<?xml version=\"1.0\"?>"
                 "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
                 "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
@@ -357,7 +367,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                 mapping.protocol == UpnpProtocol::TCP ? "TCP" : "UDP");
 
         std::string response;
-        return SendSoapRequest("DeletePortMapping", soapBody, response);
+        return SendSoapRequest("DeletePortMapping", soapBody.get(), response);
     }
 
     bool UpnpClient::GetExternalIPAddress([[maybe_unused]] std::string& ipAddress) {

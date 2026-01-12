@@ -21,7 +21,9 @@ namespace ams::mitm::ldn::ryuldn {
         SecurityParameter securityParameter;
         UserConfig userConfig;
         NetworkConfig networkConfig;
+        AddressList addressList;
         RyuNetworkConfig ryuNetworkConfig;
     } __attribute__((packed));
+    static_assert(sizeof(CreateAccessPointPrivateRequest) == 0x13C, "CreateAccessPointPrivateRequest must be 0x13C bytes");
 
 }

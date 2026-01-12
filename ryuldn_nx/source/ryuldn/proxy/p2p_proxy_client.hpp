@@ -5,6 +5,7 @@
 
 #include "../types.hpp"
 #include "../ryu_ldn_protocol.hpp"
+#include "../buffer_pool.hpp"
 #include <stratosphere.hpp>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -28,21 +29,20 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         bool _running;
 
         ProxyConfig _proxyConfig;
+        
+        // Use protocol with shared BufferPool
         RyuLdnProtocol _protocol;
 
+        // Thread management
+        os::ThreadType _receiveThread;
+        std::unique_ptr<u8[]> _threadStack;
+        static constexpr size_t ThreadStackSize = 0x4000;  // 16KB (increased from 12KB for stability)
+        
         // Synchronization
         os::SystemEvent _connectedEvent;
         os::SystemEvent _readyEvent;
         os::Mutex _stateMutex;
-
-        // Receive thread
-        os::ThreadType _receiveThread;
-        std::unique_ptr<u8[]> _threadStack;
-        static constexpr size_t ThreadStackSize = 0x4000;
-
-        // Shared packet buffer to avoid stack overflow
-        std::unique_ptr<u8[]> _packetBuffer;
-        os::Mutex _packetBufferMutex;
+        os::Mutex _sendMutex;  // Thread-safe send (NetCoreServer behavior)
 
         // Protocol handlers
         void HandleProxyConfig(const LdnHeader& header, const ProxyConfig& config);

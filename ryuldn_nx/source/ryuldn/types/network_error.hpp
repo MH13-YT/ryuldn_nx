@@ -3,19 +3,26 @@
 
 namespace ams::mitm::ldn::ryuldn {
 
-    // Network error codes
-    // Matches Ryujinx network error handling
-    enum class NetworkError : u8 {
+    // Network error codes (matches LanPlay/Ryujinx server)
+    enum class NetworkError : int32_t {
         None = 0,
+
         PortUnreachable = 1,
+
         TooManyPlayers = 2,
         VersionTooLow = 3,
         VersionTooHigh = 4,
-        ConnectNotFound = 5,
-        ConnectTimeout = 6,
-        ConnectRejected = 7,
-        ResetByPeer = 8,
-        Unknown = 255
+
+        ConnectFailure = 5,
+        ConnectNotFound = 6,
+        ConnectTimeout = 7,
+        ConnectRejected = 8,
+
+        RejectFailed = 9,
+
+        BannedByServer = 127,
+
+        Unknown = -1
     };
 
 }

@@ -73,7 +73,14 @@ dkms.conf
 make.bat
 *.log
 .vscode
+*.code-workspace
 *.zip
 
 # overlay
 *.ovl
+
+debug_logs/
+.claude/
+gdb/
+debug.bat
+debug.sh

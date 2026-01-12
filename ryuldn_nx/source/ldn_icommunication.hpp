@@ -24,6 +24,7 @@
 #include "ryuldn/ryuldn.hpp"
 
 namespace ams::mitm::ldn {
+
     class ICommunicationService {
         private:
             os::SystemEvent *state_event;
@@ -33,10 +34,11 @@ namespace ams::mitm::ldn {
             CommState current_state;
             NetworkInfo network_info;
             ryuldn::DisconnectReason disconnect_reason;
+            u32 disconnect_ip;
             NodeLatestUpdate node_latest_updates[NodeCountMax];
 
             void setState(CommState state);
-            void onNetworkChange(const NetworkInfo& info, bool connected);
+            void onNetworkChange(const NetworkInfo& info, bool connected, ryuldn::DisconnectReason reason);
         public:
             ICommunicationService()
                 : state_event(nullptr),
@@ -44,7 +46,8 @@ namespace ams::mitm::ldn {
                 ryuldn_client(nullptr),
                 ryuldn_proxy(nullptr),
                 current_state(CommState::None),
-                disconnect_reason(ryuldn::DisconnectReason::None)
+                disconnect_reason(ryuldn::DisconnectReason::None),
+                disconnect_ip(0)
             {
                 LOG_INFO(COMP_LDN_ICOM, "ICommunicationService");  // ✅ Corrigé
                 std::memset(&network_info, 0, sizeof(network_info));
@@ -77,6 +80,7 @@ namespace ams::mitm::ldn {
             Result GetNetworkInfo(sf::Out<NetworkInfo> buffer);
             Result GetIpv4Address(sf::Out<u32> address, sf::Out<u32> mask);
             Result GetDisconnectReason(sf::Out<u32> reason);
+            Result GetDisconnectIp(sf::Out<u32> ip);
             Result GetSecurityParameter(sf::Out<SecurityParameter> out);
             Result GetNetworkConfig(sf::Out<NetworkConfig> out);
             Result OpenAccessPoint();

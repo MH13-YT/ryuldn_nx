@@ -5,8 +5,10 @@
 
 #include "../types.hpp"
 #include "../ryu_ldn_protocol.hpp"
+#include "../buffer_pool.hpp"
 #include "p2p_proxy_session.hpp"
 #include "upnp_client.hpp"
+#include "../session_pool.hpp"
 #include <stratosphere.hpp>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -50,15 +52,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Master server connection
         LdnMasterProxyClient* _master;
         RyuLdnProtocol* _masterProtocol;
+        
+        // Use protocol with shared BufferPool
         RyuLdnProtocol _protocol;
-
-        // Sessions
-        std::list<P2pProxySession*> _players;
-        os::Mutex _playersLock;
-
-        // Shared packet buffer to avoid stack overflow
-        std::unique_ptr<u8[]> _packetBuffer;
-        os::Mutex _packetBufferMutex;
 
         // Authentication tokens
         std::vector<ExternalProxyToken> _waitingTokens;
@@ -69,12 +65,17 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         os::ThreadType _leaseThread;
         std::unique_ptr<u8[]> _leaseThreadStack;
         bool _leaseThreadRunning;
-        static constexpr size_t LeaseThreadStackSize = 0x4000;
+        static constexpr size_t LeaseThreadStackSize = 0x4000;  // 16KB (increased from 12KB for stability)
 
         // Accept thread
         os::ThreadType _acceptThread;
         std::unique_ptr<u8[]> _acceptThreadStack;
-        static constexpr size_t AcceptThreadStackSize = 0x4000;
+        static constexpr size_t AcceptThreadStackSize = 0x4000;  // 16KB (increased from 12KB for stability)
+
+        // Session management with pool for reuse
+        SessionPool _sessionPool;
+        std::unordered_map<u32, P2pProxySession*> _players;  // Map virtual IP to session
+        os::Mutex _playersLock;
 
         // Thread functions
         static void AcceptThreadFunc(void* arg);

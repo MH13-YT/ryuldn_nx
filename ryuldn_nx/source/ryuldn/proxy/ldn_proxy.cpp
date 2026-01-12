@@ -2,6 +2,7 @@
 #include "ldn_proxy_socket.hpp"
 #include "../ldn_master_proxy_client.hpp"
 #include "../ryu_ldn_protocol.hpp"
+#include "../buffer_pool.hpp"
 #include "../../debug.hpp"
 
 #include <arpa/inet.h>
@@ -14,19 +15,21 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         : _parent(client),
           _protocol(protocol),
           _socketsMutex(false),
-          _packetBufferMutex(false),
           _subnetMask(config.proxySubnetMask),
           _localIp(config.proxyIp),
           _broadcast(_localIp | (~_subnetMask))
     {
         LOG_HEAP(COMP_RLDN_PROXY,"LdnProxy constructor start");
-        // Initialize ephemeral port pools for each protocol (using piecewise_construct)
-        // Initialize ephemeral port pools for each protocol (using make_unique)
-        _ephemeralPorts[IPPROTO_UDP] = std::make_unique<EphemeralPortPool>();
-        _ephemeralPorts[IPPROTO_TCP] = std::make_unique<EphemeralPortPool>();
+        
+        // Initialize ephemeral port pools with explicit nothrow allocation
+        _ephemeralPorts[IPPROTO_UDP].reset(new (std::nothrow) EphemeralPortPool());
+        _ephemeralPorts[IPPROTO_TCP].reset(new (std::nothrow) EphemeralPortPool());
 
-        // Allocate shared packet buffer
-        _packetBuffer = std::make_unique<u8[]>(MaxPacketSize);
+        if (!_ephemeralPorts[IPPROTO_UDP] || !_ephemeralPorts[IPPROTO_TCP]) {
+            AMS_ABORT("LdnProxy: Failed to allocate ephemeral port pools (UDP=%p, TCP=%p)", 
+                      _ephemeralPorts[IPPROTO_UDP].get(), 
+                      _ephemeralPorts[IPPROTO_TCP].get());
+        }
 
         RegisterHandlers(protocol);
 
@@ -176,11 +179,14 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         ProxyConnectRequestFull request;
         request.info = MakeInfo(localEp, remoteEp, protocolType);
 
-        std::scoped_lock lock(_packetBufferMutex);
-        u8* packet = _packetBuffer.get();
-        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnect, request, packet);
+        ScopedBuffer packet(g_sharedBufferPool);
+        if (!packet.Get()) {
+            LOG_ERR(COMP_RLDN_PROXY,"LdnProxy: Failed to borrow buffer for RequestConnection");
+            return;
+        }
+        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnect, request, packet.Get());
 
-        _parent->SendRawPacket(packet, packetSize);
+        _parent->SendRawPacket(packet.Get(), packetSize);
 
         LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: RequestConnection from %08x:%u to %08x:%u (proto %d)",
                  request.info.sourceIpV4, request.info.sourcePort,
@@ -193,11 +199,14 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         ProxyConnectResponseFull response;
         response.info = MakeInfo(localEp, remoteEp, protocolType);
 
-        std::scoped_lock lock(_packetBufferMutex);
-        u8* packet = _packetBuffer.get();
-        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnectReply, response, packet);
+        ScopedBuffer packet(g_sharedBufferPool);
+        if (!packet.Get()) {
+            LOG_ERR(COMP_RLDN_PROXY,"LdnProxy: Failed to borrow buffer for SignalConnected");
+            return;
+        }
+        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnectReply, response, packet.Get());
 
-        _parent->SendRawPacket(packet, packetSize);
+        _parent->SendRawPacket(packet.Get(), packetSize);
 
         LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: SignalConnected from %08x:%u to %08x:%u",
                  response.info.sourceIpV4, response.info.sourcePort,
@@ -210,11 +219,14 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         message.info = MakeInfo(localEp, remoteEp, protocolType);
         message.reason = DisconnectReason::None; // TODO: proper disconnect reason
 
-        std::scoped_lock lock(_packetBufferMutex);
-        u8* packet = _packetBuffer.get();
-        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyDisconnect, message, packet);
+        ScopedBuffer packet(g_sharedBufferPool);
+        if (!packet.Get()) {
+            LOG_ERR(COMP_RLDN_PROXY,"LdnProxy: Failed to borrow buffer for EndConnection");
+            return;
+        }
+        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyDisconnect, message, packet.Get());
 
-        _parent->SendRawPacket(packet, packetSize);
+        _parent->SendRawPacket(packet.Get(), packetSize);
 
         LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: EndConnection from %08x:%u to %08x:%u",
                  message.info.sourceIpV4, message.info.sourcePort,
@@ -230,11 +242,14 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         header.info = MakeInfo(localEp, remoteEp, protocolType);
         header.dataLength = bufferSize;
 
-        std::scoped_lock lock(_packetBufferMutex);
-        u8* packet = _packetBuffer.get();
-        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyData, header, buffer, bufferSize, packet);
+        ScopedBuffer packet(g_sharedBufferPool);
+        if (!packet.Get()) {
+            LOG_ERR(COMP_RLDN_PROXY,"LdnProxy: Failed to borrow buffer for SendTo");
+            return -1;
+        }
+        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyData, header, buffer, bufferSize, packet.Get());
 
-        _parent->SendRawPacket(packet, packetSize);
+        _parent->SendRawPacket(packet.Get(), packetSize);
 
         LOG_INFO_ARGS(COMP_RLDN_PROXY,"LdnProxy: SendTo %zu bytes from %08x:%u to %08x:%u",
                  bufferSize,

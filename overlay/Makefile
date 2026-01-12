@@ -40,16 +40,20 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET_VERSION := $(shell git describe --tags --dirty)
 VERSION_DEFINES	:= -DGITDESCVER="\"${TARGET_VERSION}\""
 
-APP_TITLE	:=	ldn_mitm
+APP_TITLE	:=	RyuLDN NX
 APP_VERSION :=	${TARGET_VERSION}
 
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
-SOURCES		:=	source
+SOURCES		:=	source source/overlay source/ui
 DATA		:=	data
-INCLUDES	:=	include ../libtesla/include
+INCLUDES	:=	include source source/overlay source/ui
 
 NO_ICON		:=  1
+
+# Include libultrahand using ultrahand.mk (adds common/ and libultra source paths)
+# NOTE: We add our own source/ directories above before including ultrahand.mk
+include $(TOPDIR)/../libultrahand/ultrahand.mk
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -66,13 +70,14 @@ CXXFLAGS	:= $(CFLAGS) -fno-exceptions -std=c++20
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lnx
+LIBS	:= -lcurl -lz -lminizip -lmbedtls -lmbedx509 -lmbedcrypto -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+
 
 
 #---------------------------------------------------------------------------------

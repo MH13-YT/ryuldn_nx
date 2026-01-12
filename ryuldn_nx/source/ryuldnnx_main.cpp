@@ -31,13 +31,22 @@ extern "C" {
 
 }
 
-#include "ldnmitm_service.hpp"
+#include "ryuldnnx_service.hpp"
+#include "ryuldnnx_config.hpp"
+#include "ryuldn/buffer_pool.hpp"
 
 namespace ams {
 
     namespace {
 
-        constexpr size_t MallocBufferSize = 1_MB;
+        // Optimized heap size with 16KB network buffers:
+        // - LdnMasterProxyClient: ~48KB (16KB buffer + 32KB stack)
+        // - LdnProxy: ~16KB buffer
+        // - P2pProxyServer: ~16KB buffer
+        // - P2pProxyClient: ~48KB (16KB + 32KB)
+        // - System overhead and fragmentation
+        // Total: ~200KB active use, 4MB provides comfortable margin
+        constexpr size_t MallocBufferSize = 4_MB;
         alignas(os::MemoryPageSize) constinit u8 g_malloc_buffer[MallocBufferSize];
 
         consteval size_t GetLibnxBsdTransferMemorySize(const ::SocketInitConfig *config) {
@@ -94,7 +103,8 @@ namespace ams {
         alignas(os::MemoryPageSize) u8 g_thread_stack[ThreadStackSize];
         os::ThreadType g_thread;
 
-        alignas(0x40) constinit u8 g_heap_memory[128_KB];
+        // Increased heap for SessionPool and dynamic allocations (getaddrinfo, etc.)
+        alignas(0x40) constinit u8 g_heap_memory[512_KB];
         constinit lmem::HeapHandle g_heap_handle;
         constinit bool g_heap_initialized;
         constinit os::SdkMutex g_heap_init_mutex;
@@ -126,9 +136,30 @@ namespace ams {
             return lmem::FreeToExpHeap(GetHeapHandle(), p);
         }
 
+    } // namespace mitm
+
+} // namespace ams
+
+/* Override libnx allocator to use our custom heap */
+extern "C" void *__libnx_alloc(size_t size) {
+    return ams::mitm::Allocate(size);
+}
+
+extern "C" void *__libnx_aligned_alloc(size_t alignment, size_t size) {
+    AMS_UNUSED(alignment);
+    return ams::mitm::Allocate(size);
+}
+
+extern "C" void __libnx_free(void *p) {
+    ams::mitm::Deallocate(p, 0);
+}
+
+namespace ams {
+    namespace mitm {
+
         namespace {
 
-            struct LdnMitmManagerOptions {
+            struct RyuLdnNXManagerOptions {
                 static constexpr size_t PointerBufferSize = 0x1000;
                 static constexpr size_t MaxDomains = 0x10;
                 static constexpr size_t MaxDomainObjects = 0x100;
@@ -138,7 +169,7 @@ namespace ams {
 
             constexpr size_t MaxSessions = 3;
 
-            class ServerManager final : public sf::hipc::ServerManager<1, LdnMitmManagerOptions, MaxSessions> {
+            class ServerManager final : public sf::hipc::ServerManager<1, RyuLdnNXManagerOptions, MaxSessions> {
                         private:
                             virtual ams::Result OnNeedsToAccept(int port_index, Server *server) override;
             };
@@ -151,7 +182,7 @@ namespace ams {
                 std::shared_ptr<::Service> fsrv;
                 sm::MitmProcessInfo client_info;
                 server->AcknowledgeMitmSession(std::addressof(fsrv), std::addressof(client_info));
-                return this->AcceptMitmImpl(server, sf::CreateSharedObjectEmplaced<mitm::ldn::ILdnMitMService, mitm::ldn::LdnMitMService>(decltype(fsrv)(fsrv), client_info), fsrv);
+                return this->AcceptMitmImpl(server, sf::CreateSharedObjectEmplaced<mitm::ldn::IRyuLdnNXService, mitm::ldn::RyuLdnNXService>(decltype(fsrv)(fsrv), client_info), fsrv);
             }
 
             alignas(os::MemoryPageSize) u8 g_extra_thread_stacks[NumExtraThreads][ThreadStackSize];
@@ -171,7 +202,7 @@ namespace ams {
                     for (size_t i = 0; i < NumExtraThreads; i++)
                     {
                         R_ABORT_UNLESS(os::CreateThread(g_extra_threads + i, LoopServerThread, nullptr, g_extra_thread_stacks[i], ThreadStackSize, priority));
-                        os::SetThreadNamePointer(g_extra_threads + i, "ldn_mitm::Thread");
+                        os::SetThreadNamePointer(g_extra_threads + i, "ryuldnnx::Thread");
                     }
                 }
 
@@ -214,6 +245,20 @@ namespace ams {
             /* Mount the SD card. */
             R_ABORT_UNLESS(fs::MountSdCard("sdmc"));
 
+            // Initialize config from INI file (loads persistence state)
+            ams::mitm::ldn::LdnConfig::Initialize();
+
+            // Log current logging configuration at startup
+            {
+                const bool logEnabled = ams::mitm::ldn::LdnConfig::IsLoggingEnabled();
+                const u32 logLevel = ams::mitm::ldn::LdnConfig::GetLoggingLevelValue();
+                LOG_INFO_ARGS(COMP_MAIN, "Logging config: enabled=%d level=%u", logEnabled ? 1 : 0, logLevel);
+            }
+
+            // Initialize BufferPool for memory optimization
+            R_ABORT_UNLESS(ams::mitm::ldn::ryuldn::InitializeBufferPool());
+            LOG_INFO(COMP_RLDN_BUFPOOL, "BufferPool initialized with 3 shared buffers");
+
             /* Initialize other services. */
 
             R_ABORT_UNLESS(nifmInitialize(NifmServiceType_Admin));
@@ -237,12 +282,12 @@ namespace ams {
 
     void Main() {
         R_ABORT_UNLESS(log::Initialize());
-        LogFormat("main");
+        LOG_INFO(COMP_MAIN, "main");
 
         constexpr sm::ServiceName MitmServiceName = sm::ServiceName::Encode("ldn:u");
-        //sf::hipc::ServerManager<2, LdnMitmManagerOptions, 3> server_manager;
-        R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::LdnMitMService>(0, MitmServiceName)));
-        LogFormat("registered");
+        //sf::hipc::ServerManager<2, RyuLdnNXManagerOptions, 3> server_manager;
+        R_ABORT_UNLESS((mitm::g_server_manager.RegisterMitmServer<mitm::ldn::RyuLdnNXService>(0, MitmServiceName)));
+        LOG_INFO(COMP_MAIN, "registered");
 
         R_ABORT_UNLESS(os::CreateThread(
             &mitm::g_thread,
@@ -252,7 +297,7 @@ namespace ams {
             mitm::ThreadStackSize,
             mitm::ThreadPriority));
 
-        os::SetThreadNamePointer(&mitm::g_thread, "ldn_mitm::MainThread");
+        os::SetThreadNamePointer(&mitm::g_thread, "ryuldnnx::MainThread");
         os::StartThread(&mitm::g_thread);
 
         os::WaitThread(&mitm::g_thread);

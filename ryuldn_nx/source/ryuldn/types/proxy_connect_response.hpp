@@ -5,10 +5,10 @@
 namespace ams::mitm::ldn::ryuldn {
 
     // Proxy TCP connection response
-    // Matches Ryujinx LdnRyu/Types/ProxyConnectResponse.cs
+    // Matches Ryujinx LdnRyu/Types/ProxyConnectResponse.cs (16 bytes)
     struct ProxyConnectResponseFull {
         ProxyInfo info;     // Connection routing information
-        u32 result;         // 0 = success, non-zero = error
     } __attribute__((packed));
+    static_assert(sizeof(ProxyConnectResponseFull) == 0x10, "ProxyConnectResponseFull must be 0x10 bytes");
 
 }

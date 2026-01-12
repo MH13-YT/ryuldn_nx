@@ -4,6 +4,7 @@
 
 #include "../types.hpp"
 #include "../ryu_ldn_protocol.hpp"
+#include "../buffer_pool.hpp"
 #include <stratosphere.hpp>
 #include <sys/socket.h>
 
@@ -20,14 +21,18 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         bool _masterClosed;
         bool _running;
 
+        // Use protocol with shared BufferPool (no permanent buffer)
         RyuLdnProtocol _protocol;
 
         os::ThreadType _receiveThread;
         std::unique_ptr<u8[]> _threadStack;
-        static constexpr size_t ThreadStackSize = 0x4000;
+        static constexpr size_t ThreadStackSize = 0x4000;  // 16KB (increased for stability)
 
-        // Receive buffer to avoid stack overflow
+        // Receive buffer to avoid stack overflow during recv()
         std::unique_ptr<u8[]> _receiveBuffer;
+
+        // Send mutex for thread-safe operations (NetCoreServer behavior)
+        os::Mutex _sendMutex;
 
         static void ReceiveThreadFunc(void* arg);
         void ReceiveLoop();
@@ -51,6 +56,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         // Disconnect and stop
         void DisconnectAndStop();
+
+        // Reset session for reuse (for SessionPool)
+        void Reset(P2pProxyServer* server, s32 clientSocket);
 
         // Set virtual IP address
         void SetIpv4(u32 ip) { _virtualIpAddress = ip; }

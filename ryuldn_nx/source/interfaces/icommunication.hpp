@@ -11,6 +11,7 @@
         AMS_SF_METHOD_INFO(C, H, 3,   Result, GetDisconnectReason, 		   (ams::sf::Out<u32> reason), 																													(reason))							\
         AMS_SF_METHOD_INFO(C, H, 4,   Result, GetSecurityParameter, 		   (ams::sf::Out<ams::mitm::ldn::SecurityParameter> out), 																							(out))								\
         AMS_SF_METHOD_INFO(C, H, 5,   Result, GetNetworkConfig, 		   (ams::sf::Out<ams::mitm::ldn::NetworkConfig> out), 																								(out))								\
+              AMS_SF_METHOD_INFO(C, H, 6,   Result, GetDisconnectIp, 		   (ams::sf::Out<u32> ip), 																		(ip))														\
         AMS_SF_METHOD_INFO(C, H, 100, Result, AttachStateChangeEvent,	          (ams::sf::Out<ams::sf::CopyHandle> handle), 																									(handle))							\
         AMS_SF_METHOD_INFO(C, H, 101, Result, GetNetworkInfoLatestUpdate,       (ams::sf::Out<ams::mitm::ldn::NetworkInfo> buffer, ams::sf::OutArray<ams::mitm::ldn::NodeLatestUpdate> pUpdates), 								(buffer, pUpdates))       			\
         AMS_SF_METHOD_INFO(C, H, 102, Result, Scan, 				   (ams::sf::Out<u32> count, ams::sf::OutAutoSelectArray<ams::mitm::ldn::NetworkInfo> buffer, u16 channel, ams::mitm::ldn::ScanFilter filter), 	(count, buffer, channel, filter))	\

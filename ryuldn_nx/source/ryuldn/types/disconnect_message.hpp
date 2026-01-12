@@ -5,10 +5,10 @@
 namespace ams::mitm::ldn::ryuldn {
 
     // Disconnect notification message
-    // Matches Ryujinx LdnRyu/Types/DisconnectMessage.cs
+    // Matches Ryujinx LdnRyu/Types/DisconnectMessage.cs (DisconnectIP)
     struct DisconnectMessage {
-        DisconnectReason reason;
-        u8 padding[3];
+        u32 disconnectIp;    // IPv4 of the peer that disconnected
     } __attribute__((packed));
+    static_assert(sizeof(DisconnectMessage) == 0x4, "DisconnectMessage must be 0x4 bytes");
 
 }

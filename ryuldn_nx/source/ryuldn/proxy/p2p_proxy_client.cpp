@@ -15,19 +15,19 @@ namespace ams::mitm::ldn::ryuldn::proxy {
           _connected(false),
           _ready(false),
           _running(false),
+          _protocol(g_sharedBufferPool),  // Use shared BufferPool
+          _receiveThread{},  // Zero-initialize thread structure
           _connectedEvent(os::EventClearMode_ManualClear, true),
           _readyEvent(os::EventClearMode_ManualClear, true),
           _stateMutex(false),
-          _packetBufferMutex(false)
+          _sendMutex(false)
     {
         LOG_HEAP(COMP_RLDN_P2P_CLI, "P2pProxyClient constructor start");
+        
         // Register protocol handler
         _protocol.onProxyConfig = [this](const LdnHeader& header, const ProxyConfig& config) {
             HandleProxyConfig(header, config);
         };
-
-        // Allocate shared packet buffer
-        _packetBuffer = std::make_unique<u8[]>(MaxPacketSize);
 
         LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Created for %s:%u", _address.c_str(), _port);
         LOG_HEAP(COMP_RLDN_P2P_CLI, "P2pProxyClient constructor end");
@@ -73,14 +73,34 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             return false;
         }
 
-        // Allocate thread stack
-        _threadStack = std::make_unique<u8[]>(ThreadStackSize + os::ThreadStackAlignment);
+        // Allocate thread stack with explicit nothrow allocation
+        _threadStack.reset(new (std::nothrow) u8[ThreadStackSize + os::ThreadStackAlignment]);
+        
+        if (!_threadStack) {
+            LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to allocate thread stack");
+            close(_socket);
+            _socket = -1;
+            return false;
+        }
+        
         void* stackTop = reinterpret_cast<void*>(util::AlignUp(reinterpret_cast<uintptr_t>(_threadStack.get()), os::ThreadStackAlignment));
 
-        // Create receive thread
-        Result rc = os::CreateThread(&_receiveThread, ReceiveThreadFunc, this, stackTop, ThreadStackSize, 0x2C, 3);
+        // Create receive thread - reinitialize to ensure clean state
+        std::memset(&_receiveThread, 0, sizeof(_receiveThread));
+        LOG_INFO(COMP_RLDN_P2P_CLI, "[THREAD-DIAG] === Creating P2P-CLIENT RECEIVE THREAD ===");
+        LOG_INFO(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Thread type: RECEIVE (P2P client)");
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Thread struct @ %p", &_receiveThread);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Stack buffer @ %p", _threadStack.get());
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Stack top (aligned) @ %p", stackTop);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Stack size: 0x%x (%d bytes)", ThreadStackSize, ThreadStackSize);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Priority: %d (0x%x)", 21, 21);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Ideal core: %d", 3);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Alignment check: 0x%lx & 0xF = 0x%lx", (uintptr_t)stackTop, (uintptr_t)stackTop & 0xF);
+        Result rc = os::CreateThread(&_receiveThread, ReceiveThreadFunc, this, stackTop, ThreadStackSize, 21, 3);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG] >>> CreateThread returned: 0x%x (%s)", rc.GetValue(), R_SUCCEEDED(rc) ? "SUCCESS" : "FAILED");
         if (R_FAILED(rc)) {
-            LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to create receive thread: 0x%x", rc);
+            LOG_INFO(COMP_RLDN_P2P_CLI, "[THREAD-DIAG] !!! RECEIVE THREAD CREATION FAILED (CLIENT) !!!");
+            LOG_INFO_ARGS(COMP_RLDN_P2P_CLI, "[THREAD-DIAG]   Error code: 0x%x", rc.GetValue());
             close(_socket);
             _socket = -1;
             return false;
@@ -116,6 +136,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         if (_running) {
             os::WaitThread(&_receiveThread);
             os::DestroyThread(&_receiveThread);
+            std::memset(&_receiveThread, 0, sizeof(_receiveThread));
         }
 
         // Close socket
@@ -188,11 +209,15 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         }
 
         // Send authentication
-        std::scoped_lock lock(_packetBufferMutex);
-        u8* packet = _packetBuffer.get();
-        int packetSize = RyuLdnProtocol::Encode(PacketId::ExternalProxy, config, packet);
+        ScopedBuffer buffer(g_sharedBufferPool);
+        if (!buffer.Get()) {
+            LOG_ERR(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to borrow buffer for auth");
+            return false;
+        }
+        
+        int packetSize = RyuLdnProtocol::Encode(PacketId::ExternalProxy, config, buffer.Get());
 
-        if (!SendAsync(packet, packetSize)) {
+        if (!SendAsync(buffer.Get(), packetSize)) {
             LOG_INFO(COMP_RLDN_P2P_CLI, "P2pProxyClient: Failed to send authentication");
             return false;
         }
@@ -215,6 +240,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         if (_socket < 0 || !_connected) {
             return false;
         }
+
+        // Thread-safe send operation (NetCoreServer behavior)
+        std::lock_guard<os::Mutex> lock(_sendMutex);
 
         ssize_t sent = send(_socket, data, size, 0);
         if (sent != static_cast<ssize_t>(size)) {

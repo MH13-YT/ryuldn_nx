@@ -127,6 +127,16 @@ namespace ams::mitm::ldn {
         uint8_t _unk2[10];
     };            // 32bytes
 
+    struct AddressEntry {
+        uint32_t ipv4Address;
+        uint8_t macAddress[6];
+        uint16_t reserved;
+    };
+
+    struct AddressList {
+        AddressEntry addresses[8];
+    };
+
     struct CreateNetworkConfig {
         SecurityConfig securityConfig;
         UserConfig userConfig;

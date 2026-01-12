@@ -1,8 +1,10 @@
 #pragma once
 
 #include "ryu_ldn_protocol.hpp"
+#include "buffer_pool.hpp"
 #include "network_timeout.hpp"
 #include "types.hpp"
+#include "system_event_pool.hpp"
 #include "proxy/p2p_proxy_server.hpp"
 #include "proxy/p2p_proxy_client.hpp"
 
@@ -19,7 +21,7 @@
 namespace ams::mitm::ldn::ryuldn {
 
     // Callback pour les changements de réseau (correspond à la V1)
-    using NetworkChangeCallback = std::function<void(const NetworkInfo&, bool)>;
+    using NetworkChangeCallback = std::function<void(const NetworkInfo&, bool, DisconnectReason)>;
 
     // Forward declarations comme dans la V1
     namespace proxy {
@@ -37,27 +39,24 @@ namespace ams::mitm::ldn::ryuldn {
         bool _networkConnected;
         bool _stop;
         bool _useP2pProxy;
+        bool _constructionFailed;  // Mark if constructor failed
+        bool _serverUnreachable;   // Mark if server is permanently unreachable
+        int _connectionAttempts;   // Track connection attempts
 
         os::ThreadType _workerThread;
         std::unique_ptr<u8[]> _threadStack;
-        static constexpr size_t ThreadStackSize = 0x8000;
+        static constexpr size_t ThreadStackSize = 0x4000;  // Reduced from 32KB to 16KB
 
-        // Shared packet buffer
-        std::unique_ptr<u8[]> _packetBuffer;
-        os::Mutex _packetBufferMutex;
+        // Use SystemEvent container (direct members, no allocations)
+        SystemEventContainer _events;
 
-        // Événements rétablis en pointeurs bruts (non RAII)
-        os::SystemEvent* _connectedEvent;
-        os::SystemEvent* _errorEvent;
-        os::SystemEvent* _scanEvent;
-        os::SystemEvent* _rejectEvent;
-        os::SystemEvent* _apConnectedEvent;
-
+        // Use protocol with shared BufferPool
         RyuLdnProtocol _protocol;
         std::unique_ptr<NetworkTimeout> _timeout;
 
         std::vector<NetworkInfo> _availableGames;
         DisconnectReason _disconnectReason;
+        u32 _disconnectIp;
         NetworkError _lastError;
         NetworkInfo _lastNetworkInfo;
 
@@ -77,6 +76,8 @@ namespace ams::mitm::ldn::ryuldn {
         NetworkChangeCallback _networkChangeCallback;
         ProxyConfigCallback _proxyConfigCallback;
         ProxyDataCallback _proxyDataCallback;
+
+        std::mutex _receiveMutex;  // Protect ReceiveData() to prevent concurrent socket reads
 
         // Méthodes privées
         static void WorkerThreadFunc(void* arg);
@@ -107,12 +108,23 @@ namespace ams::mitm::ldn::ryuldn {
         void HandlePing(const LdnHeader& header, const PingMessage& ping);
         void HandleNetworkError(const LdnHeader& header, const NetworkErrorMessage& error);
         void HandleExternalProxy(const LdnHeader& header, const ExternalProxyConfig& config);
+        void HandleSetAdvertiseData(const LdnHeader& header, const u8* data, u32 size);
+        void HandleSetAcceptPolicy(const LdnHeader& header, const SetAcceptPolicyRequest& req);
+        void HandleCreateAccessPoint(const LdnHeader& header, const CreateAccessPointRequest& req, const u8* data, u32 size);
+        void HandleCreateAccessPointPrivate(const LdnHeader& header, const CreateAccessPointPrivateRequest& req, const u8* data, u32 size);
+        void HandleConnect(const LdnHeader& header, const ConnectRequest& req);
+        void HandleConnectPrivate(const LdnHeader& header, const ConnectPrivateRequest& req);
+        void HandleScanRequest(const LdnHeader& header, const ScanFilter& filter);
+        void HandleReject(const LdnHeader& header, const RejectRequest& req);
 
         NetworkError ConsumeNetworkError();
 
     public:
         LdnMasterProxyClient(const char* serverAddress, int serverPort, bool useP2pProxy = true);
         ~LdnMasterProxyClient();
+
+        // Check if construction completed successfully
+        bool IsConstructionSuccessful() const { return !_constructionFailed; }
 
         Result Initialize();
         Result Finalize();
@@ -145,6 +157,7 @@ namespace ams::mitm::ldn::ryuldn {
         bool IsNetworkConnected() const { return _networkConnected; }
         const ProxyConfig& GetProxyConfig() const { return _config; }
         DisconnectReason GetDisconnectReason() const { return _disconnectReason; }
+        u32 GetDisconnectIp() const { return _disconnectIp; }
         RyuLdnProtocol* GetProtocol() { return &_protocol; }
     };
 

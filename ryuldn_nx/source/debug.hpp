@@ -5,8 +5,7 @@
 #include <cstdarg>
 
 enum ComponentId {
-    COMP_MAIN = 0, 
-    COMP_SVC, 
+    COMP_MAIN = 0,
     COMP_LDN_ICOM, 
     COMP_RLDN_PROTOCOL, 
     COMP_RLDN_PROXY,
@@ -15,9 +14,10 @@ enum ComponentId {
     COMP_RLDN_P2P_CLI, 
     COMP_RLDN_P2P_SES,
     COMP_RLDN_UPNP, 
-    COMP_CONFIG, 
+    COMP_RLDN_MASTER,
+    COMP_RLDN_CLI,
+    COMP_RLDN_BUFPOOL,
     COMP_LDN_MONITOR, 
-    COMP_IP_UTILS, 
     COMP_BSD_MITM_SVC,
     COMPCOUNT
 };
@@ -32,9 +32,9 @@ namespace ams::log {
     extern std::atomic<u32> gLogLevel;
     
     inline constexpr const char *const gCompPrefixes[COMPCOUNT] = {
-        "[MAIN] ", "[SVC] ", "[LDN-ICOMM] ", "[RLDN-PROTOCOL] ", "[RLDN-PROXY] ",
+        "[MAIN] ","[LDN-ICOMM] ", "[RLDN-PROTOCOL] ", "[RLDN-PROXY] ",
         "[RLDN-PROXY-SOC] ", "[RLDN-P2P-SRV] ", "[RLDN-P2P-CLI] ", "[RLDN-P2P-SES] ",
-        "[RLDN-UPNP] ", "[CONFIG] ", "[LDN-MONITOR] ", "[IP-UTILS] ", "[BSD-MITM-SVC] "
+        "[RLDN-UPNP] ", "[RLDN-MASTER] ", "[RLDN-CLI] ", "[RLDN-BUFPOOL] ", "[LDN-MONITOR] ", "[BSD-MITM-SVC] "
     };
     
     inline constexpr const char *const gLevelPrefixes[] = {
@@ -45,22 +45,22 @@ namespace ams::log {
 // Macro de base sans arguments
 #define LOG_COMP(comp, lvl, fmt)                                              \
     do {                                                                       \
-        const u32 el = ams::log::gLogLevel.load(std::memory_order_relaxed);   \
+        const u32 el = ::ams::log::gLogLevel.load(std::memory_order_relaxed);   \
         if (el >= static_cast<u32>(lvl)) [[likely]] {                         \
-            ams::log::LogFormatImpl("%s%s" fmt "\n",                          \
-                                    ams::log::gCompPrefixes[comp],            \
-                                    ams::log::gLevelPrefixes[lvl]);           \
+            ::ams::log::LogFormatImpl("%s%s" fmt "\n",                          \
+                                    ::ams::log::gCompPrefixes[comp],            \
+                                    ::ams::log::gLevelPrefixes[lvl]);           \
         }                                                                      \
     } while (0)
 
 // Macro avec arguments variadiques
 #define LOG_COMP_ARGS(comp, lvl, fmt, ...)                                    \
     do {                                                                       \
-        const u32 el = ams::log::gLogLevel.load(std::memory_order_relaxed);   \
+        const u32 el = ::ams::log::gLogLevel.load(std::memory_order_relaxed);   \
         if (el >= static_cast<u32>(lvl)) [[likely]] {                         \
-            ams::log::LogFormatImpl("%s%s" fmt "\n",                          \
-                                    ams::log::gCompPrefixes[comp],            \
-                                    ams::log::gLevelPrefixes[lvl],            \
+            ::ams::log::LogFormatImpl("%s%s" fmt "\n",                          \
+                                    ::ams::log::gCompPrefixes[comp],            \
+                                    ::ams::log::gLevelPrefixes[lvl],            \
                                     __VA_ARGS__);                             \
         }                                                                      \
     } while (0)
@@ -82,19 +82,19 @@ namespace ams::log {
 // Macro pour dump hexadécimal
 #define LOG_HEX(comp, data, size)                                             \
     do {                                                                       \
-        const u32 el = ams::log::gLogLevel.load(std::memory_order_relaxed);   \
+        const u32 el = ::ams::log::gLogLevel.load(std::memory_order_relaxed);   \
         if (el >= 4) {                                                         \
-            ams::log::LogFormatImpl("%sHex dump (%d bytes):\n",              \
-                                    ams::log::gCompPrefixes[comp], size);     \
-            ams::log::LogHexImpl(data, size);                                 \
+            ::ams::log::LogFormatImpl("%sHex dump (%d bytes):\n",              \
+                                    ::ams::log::gCompPrefixes[comp], size);     \
+            ::ams::log::LogHexImpl(data, size);                                 \
         }                                                                      \
     } while (0)
 
 #define LOG_HEAP(comp, tag) \
     do { \
-        const u32 el = ams::log::gLogLevel.load(std::memory_order_relaxed); \
+        const u32 el = ::ams::log::gLogLevel.load(std::memory_order_relaxed); \
         if (el >= 3) { \
-            ams::log::LogHeapUsage(tag); \
+            ::ams::log::LogHeapUsage(tag); \
         } \
     } while (0)
 

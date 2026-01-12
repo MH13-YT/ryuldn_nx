@@ -18,13 +18,17 @@ namespace ams::mitm::ldn::ryuldn::proxy {
           _hasPortMapping(false),
           _master(master),
           _masterProtocol(masterProtocol),
-          _playersLock(false),
-          _packetBufferMutex(false),
+          _protocol(g_sharedBufferPool),  // Use shared BufferPool
           _tokensLock(false),
           _tokenEvent(os::EventClearMode_ManualClear, true),
-          _leaseThreadRunning(false)
+          _leaseThread{},  // Zero-initialize thread structures
+          _leaseThreadRunning(false),
+          _acceptThread{},  // Zero-initialize thread structures
+          _sessionPool(this),  // Initialize session pool
+          _playersLock(false)
     {
         LOG_HEAP(COMP_RLDN_P2P_SRV, "P2pProxyServer constructor start");
+        
         // Register handlers with master protocol
         _masterProtocol->onExternalProxyToken = [this](const LdnHeader& header, const ExternalProxyToken& token) {
             HandleToken(header, token);
@@ -33,9 +37,6 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         _masterProtocol->onExternalProxyState = [this](const LdnHeader& header, const ExternalProxyConnectionState& state) {
             HandleStateChange(header, state);
         };
-
-        // Allocate shared packet buffer
-        _packetBuffer = std::make_unique<u8[]>(MaxPacketSize);
 
         LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Created on port %u", _privatePort);
         LOG_HEAP(COMP_RLDN_P2P_SRV, "P2pProxyServer constructor end");
@@ -83,9 +84,10 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             return false;
         }
 
-        // Allocate accept thread stack
+        // Allocate accept thread stack with explicit nothrow allocation
         LOG_HEAP(COMP_RLDN_P2P_SRV, "before P2pProxyServer accept thread stack");
-        _acceptThreadStack = std::make_unique<u8[]>(AcceptThreadStackSize + os::ThreadStackAlignment);
+        _acceptThreadStack.reset(new (std::nothrow) u8[AcceptThreadStackSize + os::ThreadStackAlignment]);
+        
         if (!_acceptThreadStack) {
             LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to allocate accept thread stack");
             LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxyServer accept thread stack FAILED");
@@ -96,12 +98,27 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxyServer accept thread stack");
         void* acceptStackTop = reinterpret_cast<void*>(util::AlignUp(reinterpret_cast<uintptr_t>(_acceptThreadStack.get()), os::ThreadStackAlignment));
 
-        // Create accept thread
-        Result rc = os::CreateThread(&_acceptThread, AcceptThreadFunc, this, acceptStackTop, AcceptThreadStackSize, 0x2C, 3);
+        // Create accept thread - reinitialize to ensure clean state
+        std::memset(&_acceptThread, 0, sizeof(_acceptThread));
+        LOG_INFO(COMP_RLDN_P2P_SRV, "[THREAD-DIAG] === Creating P2P-SERVER ACCEPT THREAD ===");
+        LOG_INFO(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Thread type: ACCEPT (P2P relay server)");
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Thread struct @ %p", &_acceptThread);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Stack buffer @ %p", _acceptThreadStack.get());
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Stack top (aligned) @ %p", acceptStackTop);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Stack size: 0x%x (%d bytes)", AcceptThreadStackSize, AcceptThreadStackSize);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Priority: %d (0x%x)", 21, 21);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Ideal core: %d", 3);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Stack alignment: %lu bytes", os::ThreadStackAlignment);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Alignment check: 0x%lx & 0xF = 0x%lx", (uintptr_t)acceptStackTop, (uintptr_t)acceptStackTop & 0xF);
+        Result rc = os::CreateThread(&_acceptThread, AcceptThreadFunc, this, acceptStackTop, AcceptThreadStackSize, 21, 3);
+        LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG] >>> CreateThread returned: 0x%x (%s)", rc.GetValue(), R_SUCCEEDED(rc) ? "SUCCESS" : "FAILED");
         if (R_FAILED(rc)) {
-            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to create accept thread: 0x%x", rc);
+            LOG_INFO(COMP_RLDN_P2P_SRV, "[THREAD-DIAG] !!! ACCEPT THREAD CREATION FAILED !!!");
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Error code: 0x%x", rc.GetValue());
+            LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "[THREAD-DIAG]   Stack allocated: %s", _acceptThreadStack ? "YES" : "NO");
             close(_listenSocket);
             _listenSocket = -1;
+            std::memset(&_acceptThread, 0, sizeof(_acceptThread));  // Clean up on failure
             return false;
         }
 
@@ -117,6 +134,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             return;
         }
 
+        LOG_INFO(COMP_RLDN_P2P_SRV, "[THREAD-DIAG] Stopping P2P Server threads...");
         _running = false;
 
         // Close listen socket to wake up accept thread
@@ -129,22 +147,18 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Wait for accept thread
         os::WaitThread(&_acceptThread);
         os::DestroyThread(&_acceptThread);
+        std::memset(&_acceptThread, 0, sizeof(_acceptThread));
 
-        // Stop all sessions
-        {
-            std::scoped_lock lk(_playersLock);
-            for (auto* session : _players) {
-                session->DisconnectAndStop();
-                delete session;
-            }
-            _players.clear();
-        }
+        // Stop all sessions via pool
+        _sessionPool.Clear();
+        _players.clear();
 
         // Stop lease renewal thread
         if (_leaseThreadRunning) {
             _leaseThreadRunning = false;
             os::WaitThread(&_leaseThread);
             os::DestroyThread(&_leaseThread);
+            std::memset(&_leaseThread, 0, sizeof(_leaseThread));
         }
 
         LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Stopped");
@@ -179,6 +193,9 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     }
 
     u16 P2pProxyServer::NatPunch() {
+        // UPnP is optional - if it fails, we fallback to server relay
+        // No try-catch needed (exceptions disabled), failures return 0
+        
         // Discover UPnP device
         if (!_upnpClient.DiscoverDevice()) {
             LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: UPnP device not found");
@@ -203,17 +220,32 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                 _hasPortMapping = true;
                 LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Port mapping created %u -> %u", _privatePort, _publicPort);
 
-                // Start lease renewal thread
-                _leaseThreadStack = std::make_unique<u8[]>(LeaseThreadStackSize + os::ThreadStackAlignment);
-                void* leaseStackTop = reinterpret_cast<void*>(util::AlignUp(reinterpret_cast<uintptr_t>(_leaseThreadStack.get()), os::ThreadStackAlignment));
+                // Start lease renewal thread with explicit nothrow allocation
+                _leaseThreadStack.reset(new (std::nothrow) u8[LeaseThreadStackSize + os::ThreadStackAlignment]);
+                
+                if (!_leaseThreadStack) {
+                    LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to allocate lease thread stack");
+                    // Continue without renewal thread - mapping will expire after lease time
+                } else {
+                    void* leaseStackTop = reinterpret_cast<void*>(util::AlignUp(reinterpret_cast<uintptr_t>(_leaseThreadStack.get()), os::ThreadStackAlignment));
 
-                Result rc = os::CreateThread(&_leaseThread, LeaseRenewalThreadFunc, this, leaseStackTop, LeaseThreadStackSize, 0x2C, 3);
-                if (R_SUCCEEDED(rc)) {
-                    _leaseThreadRunning = true;
-                    os::StartThread(&_leaseThread);
+                    // Create lease renewal thread - reinitialize to ensure clean state
+                    std::memset(&_leaseThread, 0, sizeof(_leaseThread));
+                    Result rc = os::CreateThread(&_leaseThread, LeaseRenewalThreadFunc, this, leaseStackTop, LeaseThreadStackSize, 0x2C, 3);
+                    if (R_SUCCEEDED(rc)) {
+                        _leaseThreadRunning = true;
+                        os::StartThread(&_leaseThread);
+                    }
                 }
 
                 return _publicPort;
+            }
+
+            // Fast-fail on hard HTTP errors (e.g. 404 Not Found means IGD rejects AddPortMapping)
+            const int lastStatus = _upnpClient.GetLastHttpStatus();
+            if (lastStatus == 404) {
+                LOG_WARN_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Port mapping rejected with HTTP %d - stopping attempts", lastStatus);
+                break;
             }
 
             _publicPort++;
@@ -243,20 +275,20 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                 break;
             }
 
-            // Create new session
-            LOG_HEAP(COMP_RLDN_P2P_SRV, "before P2pProxySession");
-            P2pProxySession* session = new (std::nothrow) P2pProxySession(this, clientSocket);
+            // Create or reuse session from pool
+            LOG_HEAP(COMP_RLDN_P2P_SRV, "before SessionPool Acquire");
+            P2pProxySession* session = _sessionPool.Acquire(clientSocket);
             if (session == nullptr) {
-                LOG_INFO(COMP_RLDN_P2P_SRV, "ERROR: Failed to allocate P2pProxySession - out of memory");
-                LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxySession FAILED");
+                LOG_INFO(COMP_RLDN_P2P_SRV, "ERROR: Failed to acquire session from pool - pool exhausted or out of memory");
+                LOG_HEAP(COMP_RLDN_P2P_SRV, "after SessionPool Acquire FAILED");
                 close(clientSocket);
                 continue;
             }
-            LOG_HEAP(COMP_RLDN_P2P_SRV, "after P2pProxySession");
+            LOG_HEAP(COMP_RLDN_P2P_SRV, "after SessionPool Acquire");
 
             if (!session->Start()) {
                 LOG_INFO(COMP_RLDN_P2P_SRV, "P2pProxyServer: Failed to start session");
-                delete session;
+                _sessionPool.Release(session);
                 continue;
             }
 
@@ -326,15 +358,12 @@ namespace ams::mitm::ldn::ryuldn::proxy {
             // Disconnect and remove session
             {
                 std::scoped_lock lk(_playersLock);
-                for (auto it = _players.begin(); it != _players.end(); ) {
-                    P2pProxySession* session = *it;
-                    if (session->GetVirtualIpAddress() == state.ipAddress) {
-                        session->DisconnectAndStop();
-                        delete session;
-                        it = _players.erase(it);
-                    } else {
-                        ++it;
-                    }
+                auto it = _players.find(state.ipAddress);
+                if (it != _players.end()) {
+                    P2pProxySession* session = it->second;
+                    session->DisconnectAndStop();
+                    _sessionPool.Release(session);  // Return to pool
+                    _players.erase(it);
                 }
             }
         }
@@ -369,16 +398,14 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
         if (isBroadcast) {
             // Send to all players
-            for (auto* player : _players) {
-                action(player);
+            for (auto& pair : _players) {
+                action(pair.second);
             }
         } else {
             // Send to specific player
-            for (auto* player : _players) {
-                if (player->GetVirtualIpAddress() == destIp) {
-                    action(player);
-                    break;
-                }
+            auto it = _players.find(destIp);
+            if (it != _players.end()) {
+                action(it->second);
             }
         }
     }
@@ -386,40 +413,40 @@ namespace ams::mitm::ldn::ryuldn::proxy {
     void P2pProxyServer::HandleProxyDisconnect(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyDisconnectMessageFull& message) {
         ProxyDisconnectMessageFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            std::scoped_lock lock(_packetBufferMutex);
-            u8* packet = _packetBuffer.get();
-            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyDisconnect, msg, packet);
-            target->SendAsync(packet, packetSize);
+            ScopedBuffer buffer(g_sharedBufferPool);
+            if (!buffer.Get()) return;
+            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyDisconnect, msg, buffer.Get());
+            target->SendAsync(buffer.Get(), packetSize);
         });
     }
 
     void P2pProxyServer::HandleProxyData(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyDataHeaderFull& message, const u8* data, u32 dataSize) {
         ProxyDataHeaderFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            std::scoped_lock lock(_packetBufferMutex);
-            u8* packet = _packetBuffer.get();
-            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyData, msg, data, dataSize, packet);
-            target->SendAsync(packet, packetSize);
+            ScopedBuffer buffer(g_sharedBufferPool);
+            if (!buffer.Get()) return;
+            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyData, msg, data, dataSize, buffer.Get());
+            target->SendAsync(buffer.Get(), packetSize);
         });
     }
 
     void P2pProxyServer::HandleProxyConnectReply(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyConnectResponseFull& message) {
         ProxyConnectResponseFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            std::scoped_lock lock(_packetBufferMutex);
-            u8* packet = _packetBuffer.get();
-            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnectReply, msg, packet);
-            target->SendAsync(packet, packetSize);
+            ScopedBuffer buffer(g_sharedBufferPool);
+            if (!buffer.Get()) return;
+            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnectReply, msg, buffer.Get());
+            target->SendAsync(buffer.Get(), packetSize);
         });
     }
 
     void P2pProxyServer::HandleProxyConnect(P2pProxySession* sender, [[maybe_unused]] const LdnHeader& header, const ProxyConnectRequestFull& message) {
         ProxyConnectRequestFull msg = message;
         RouteMessage(sender, msg, [&](P2pProxySession* target) {
-            std::scoped_lock lock(_packetBufferMutex);
-            u8* packet = _packetBuffer.get();
-            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnect, msg, packet);
-            target->SendAsync(packet, packetSize);
+            ScopedBuffer buffer(g_sharedBufferPool);
+            if (!buffer.Get()) return;
+            int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConnect, msg, buffer.Get());
+            target->SendAsync(buffer.Get(), packetSize);
         });
     }
 
@@ -483,14 +510,15 @@ namespace ams::mitm::ldn::ryuldn::proxy {
                         if (_players.empty()) {
                             Configure(pconfig);
                         }
-                        _players.push_back(session);
+                        _players[waitToken.virtualIp] = session;
                     }
 
                     // Send proxy config to client
-                    std::scoped_lock lock(_packetBufferMutex);
-            u8* packet = _packetBuffer.get();
-                    int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConfig, pconfig, packet);
-                    session->SendAsync(packet, packetSize);
+                    ScopedBuffer buffer(g_sharedBufferPool);
+                    if (buffer.Get()) {
+                        int packetSize = RyuLdnProtocol::Encode(PacketId::ProxyConfig, pconfig, buffer.Get());
+                        session->SendAsync(buffer.Get(), packetSize);
+                    }
 
                     LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: User registered with virtual IP 0x%08x", waitToken.virtualIp);
                     return true;
@@ -521,26 +549,31 @@ namespace ams::mitm::ldn::ryuldn::proxy {
 
     void P2pProxyServer::DisconnectProxyClient(P2pProxySession* session) {
         bool removed = false;
+        u32 virtualIp = session->GetVirtualIpAddress();
 
         {
             std::scoped_lock lk(_playersLock);
-            auto it = std::find(_players.begin(), _players.end(), session);
-            if (it != _players.end()) {
+            auto it = _players.find(virtualIp);
+            if (it != _players.end() && it->second == session) {
                 _players.erase(it);
                 removed = true;
             }
         }
 
         if (removed) {
+            // Return session to pool for reuse
+            _sessionPool.Release(session);
+            
             // Notify master server of disconnection
             ExternalProxyConnectionState state;
-            state.ipAddress = session->GetVirtualIpAddress();
+            state.ipAddress = virtualIp;
             state.connected = false;
 
-            std::scoped_lock lock(_packetBufferMutex);
-            u8* packet = _packetBuffer.get();
-            int packetSize = RyuLdnProtocol::Encode(PacketId::ExternalProxyState, state, packet);
-            _master->SendRawPacket(packet, packetSize);
+            ScopedBuffer buffer(g_sharedBufferPool);
+            if (buffer.Get()) {
+                int packetSize = RyuLdnProtocol::Encode(PacketId::ExternalProxyState, state, buffer.Get());
+                _master->SendRawPacket(buffer.Get(), packetSize);
+            }
 
             LOG_INFO_ARGS(COMP_RLDN_P2P_SRV, "P2pProxyServer: Client disconnected (virtual IP 0x%08x)", session->GetVirtualIpAddress());
         }
