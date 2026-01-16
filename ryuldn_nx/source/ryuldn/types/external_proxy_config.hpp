@@ -11,5 +11,6 @@ namespace ams::mitm::ldn::ryuldn {
         u16 proxyPort;          // Proxy port
         u8 token[16];           // Authentication token
     } __attribute__((packed));
+    static_assert(sizeof(ExternalProxyConfig) == 0x26, "ExternalProxyConfig must be 0x26 bytes");
 
 }

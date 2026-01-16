@@ -7,6 +7,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <string>
+#include <miniupnpc/miniupnpc.h>
+#include <miniupnpc/upnpcommands.h>
+#include <miniupnpc/upnperrors.h>
 
 namespace ams::mitm::ldn::ryuldn::proxy {
 
@@ -46,8 +49,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         static constexpr const char* SSDP_MULTICAST = "239.255.255.250";
         static constexpr u32 DISCOVERY_TIMEOUT_MS = 2500;
 
-        std::string _gatewayUrl;
-        std::string _controlUrl;
+        
         bool _discovered;
 
         // Track last HTTP status to allow callers to fast-fail on hard errors (e.g. 404)
@@ -56,12 +58,12 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         s32 _socket;
         os::Mutex _mutex;
 
-        bool SendSsdpDiscovery();
-        bool ParseSsdpResponse(const char* response, size_t length);
-        bool FetchDeviceDescription(const std::string& location);
-        bool ParseControlUrl(const char* xml);
+        /* miniupnpc state */
+        struct UPNPUrls _urls;
+        struct IGDdatas _data;
+        char _lanaddr[64];
+        bool _hasIgd;
 
-        bool SendSoapRequest(const std::string& action, const std::string& body, std::string& response);
         bool GetLocalIPAddress(std::string& ipAddress);
 
     public:
@@ -86,8 +88,7 @@ namespace ams::mitm::ldn::ryuldn::proxy {
         // Last HTTP status for the most recent SOAP request (0 if none)
         int GetLastHttpStatus() const { return _lastHttpStatus; }
 
-        // Get gateway URL
-        const std::string& GetGatewayUrl() const { return _gatewayUrl; }
+        // (gateway URL not exposed; use IsDiscovered/GetLastHttpStatus)
     };
 
 } // namespace ams::mitm::ldn::ryuldn::proxy

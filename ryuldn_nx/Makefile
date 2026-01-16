@@ -3,6 +3,12 @@
 #---------------------------------------------------------------------------------
 include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../Atmosphere-libs/config/templates/stratosphere.mk
 
+# Ensure PORTLIBS points to devkitPro portlibs for the Switch target when unset
+PORTLIBS ?= $(DEVKITPRO)/portlibs/switch
+
+# Link with miniupnpc
+LIBS += -lminiupnpc
+
 #---------------------------------------------------------------------------------
 # version control constants
 #---------------------------------------------------------------------------------

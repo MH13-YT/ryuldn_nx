@@ -15,16 +15,15 @@ namespace ams::mitm::ldn::ryuldn {
     // Largest control message (ConnectRequest): 1276 bytes
     constexpr int MaxPacketSize = 16384;  // 16KB buffer
 
-    // LDN Protocol Header (12 bytes - aligned layout to match C# without Pack=1)
-    // C# StructLayout without Pack=1 adds 2-byte padding between Version and DataSize
-    // Layout: Magic(4) | Type(1) | Version(1) | Padding(2) | DataSize(4)
+    // LDN Protocol Header (10 bytes - matches C# StructLayout(LayoutKind.Sequential, Size = 0xA))
+    // Must match official ldn-master server exactly
+    // Layout: Magic(4) | Type(1) | Version(1) | DataSize(4)
     struct LdnHeader {
         u32 magic;      // Offset 0-3: 'RLDN' magic number
         u8 type;        // Offset 4: PacketId type
         u8 version;     // Offset 5: Protocol version
-        u16 _padding;   // Offset 6-7: Padding for alignment (C# default behavior)
-        s32 dataSize;   // Offset 8-11: Size of data following header
-    };
-    static_assert(sizeof(LdnHeader) == 0xC, "LdnHeader must be 0xC bytes (12) to match C# default alignment");
+        s32 dataSize;   // Offset 6-9: Size of data following header
+    } __attribute__((packed));
+    static_assert(sizeof(LdnHeader) == 0xA, "LdnHeader must be 0xA bytes (10) to match C# server");
 
 }

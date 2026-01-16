@@ -9,6 +9,10 @@ endif
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
+# Ensure PORTLIBS points to devkitPro portlibs for the Switch target when unset
+# This makes headers like curl/curl.h available via $(LIBDIRS) -> -I$(dir)/include
+PORTLIBS ?= $(DEVKITPRO)/portlibs/switch
+
 #---------------------------------------------------------------------------------
 # TARGET is the name of the output
 # BUILD is the directory where object files & intermediate files will be placed
@@ -70,7 +74,7 @@ CXXFLAGS	:= $(CFLAGS) -fno-exceptions -std=c++20
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lcurl -lz -lminizip -lmbedtls -lmbedx509 -lmbedcrypto -lnx
+LIBS	:= -lcurl -lz -lminizip -lminiupnpc -lmbedtls -lmbedx509 -lmbedcrypto -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

@@ -53,7 +53,7 @@ namespace ams::mitm::ldn::ryuldn {
     private:
         static constexpr int HeaderSize = sizeof(LdnHeader);
 
-        // Persistent header buffer (small - only 16 bytes)
+        // Persistent header buffer (small - only 10 bytes for LdnHeader)
         u8 _headerBuffer[HeaderSize];
         int _headerBytesReceived;
         
@@ -72,6 +72,24 @@ namespace ams::mitm::ldn::ryuldn {
         template<typename T>
         static void ParseStruct(const u8* data, T& output) {
             std::memcpy(&output, data, sizeof(T));
+        }
+
+        // Special parser for NetworkInfo which is sent as NetworkId + CommonNetworkInfo + LdnNetworkInfo
+        // but we only want to parse the LdnNetworkInfo part (last 1072 bytes out of 1152 bytes)
+        static void ParseNetworkInfo(const u8* data, u32 dataSize, LdnNetworkInfo& output) {
+            // Server sends: NetworkId(32) + CommonNetworkInfo(48) + LdnNetworkInfo(1072) = 1152 bytes
+            // We only want the LdnNetworkInfo part
+            const u32 NetworkIdSize = 32;      // IntentId(16) + SessionId(16)
+            const u32 CommonNetworkInfoSize = 48;  // MacAddress(6) + Ssid(34) + channel(2) + linkLevel(1) + networkType(1) + _unk(4)
+            const u32 LdnNetworkInfoOffset = NetworkIdSize + CommonNetworkInfoSize;
+            const u32 LdnNetworkInfoSize = sizeof(LdnNetworkInfo);
+            
+            if (dataSize < LdnNetworkInfoOffset + LdnNetworkInfoSize) {
+                std::memset(&output, 0, sizeof(output));
+                return;
+            }
+            
+            std::memcpy(&output, data + LdnNetworkInfoOffset, LdnNetworkInfoSize);
         }
 
     public:

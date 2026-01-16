@@ -228,8 +228,20 @@ bool LdnMasterProxyClient::EnsureConnected() {
     fcntl(_socket, F_SETFL, flags & ~O_NONBLOCK);
     LOG_DBG(COMP_RLDN_MASTER," Switched socket to blocking mode");
 
-    // NOTE: Keep Nagle enabled to encourage coalescing of small packets; disabling it caused header/data splits.
-    LOG_DBG(COMP_RLDN_MASTER," TCP_NODELAY left disabled to favor packet coalescing");
+    // Enable TCP_NODELAY to match NetCoreServer client behavior
+    // This disables Nagle algorithm for immediate packet delivery
+    int nodelay = 1;
+    if (setsockopt(_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) == 0) {
+        LOG_DBG(COMP_RLDN_MASTER," TCP_NODELAY enabled for immediate delivery");
+    } else {
+        LOG_WARN(COMP_RLDN_MASTER," Failed to enable TCP_NODELAY");
+    }
+
+    // Increase send/receive buffers for better throughput
+    int sndbuf = 65536;
+    int rcvbuf = 65536;
+    setsockopt(_socket, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    setsockopt(_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     _connected = true;
     _protocol.Reset();
@@ -352,6 +364,8 @@ int LdnMasterProxyClient::SendPacket(const u8* data, int size) {
         return -1;
     }
     
+    // Send entire buffer in one call to avoid fragmentation
+    // TCP_NODELAY is already enabled, so this will be sent immediately
     int sent = 0;
     while (sent < size) {
         int rc = ::send(_socket, data + sent, size - sent, 0);
@@ -365,13 +379,12 @@ int LdnMasterProxyClient::SendPacket(const u8* data, int size) {
             return -1;
         }
         sent += rc;
-        LOG_DBG_ARGS(COMP_RLDN_MASTER," SendPacket: Sent %d bytes (total %d/%d)", rc, sent, size);
+        if (rc > 0) {
+            LOG_DBG_ARGS(COMP_RLDN_MASTER," SendPacket: Sent %d bytes (total %d/%d)", rc, sent, size);
+        }
     }
-    LOG_DBG_ARGS(COMP_RLDN_MASTER," SendPacket: Successfully sent all %d bytes", sent);
     
-    // Small delay to help TCP coalesce packets and avoid fragmentation
-    // Bumped to 10ms to better group header+payload for the server's single-threaded parser
-    os::SleepThread(TimeSpan::FromMilliSeconds(10));
+    LOG_DBG_ARGS(COMP_RLDN_MASTER," SendPacket: Successfully sent all %d bytes", sent);
     
     return sent;
 }

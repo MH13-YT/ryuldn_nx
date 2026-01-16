@@ -22,7 +22,7 @@ namespace ams::mitm::ldn::ryuldn {
         int index = 0;
 
         while (index < size) {
-            // Phase 1: Assemble header (16 bytes)
+            // Phase 1: Assemble header (10 bytes - sizeof(LdnHeader))
             if (_headerBytesReceived < HeaderSize) {
                 int copyable = std::min(size - index, HeaderSize - _headerBytesReceived);
                 std::memcpy(_headerBuffer + _headerBytesReceived, data + index + offset, copyable);
@@ -144,8 +144,13 @@ namespace ams::mitm::ldn::ryuldn {
             case PacketId::Connected:
                 LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling Connected");
                 if (onConnected) {
+                    LdnNetworkInfo ldnInfo;
+                    ParseNetworkInfo(data, header.dataSize, ldnInfo);
+                    // Note: We receive full NetworkInfo but extract only LdnNetworkInfo
+                    // Convert to NetworkInfo for callback compatibility
                     NetworkInfo info;
-                    ParseStruct(data, info);
+                    std::memset(&info, 0, sizeof(info));
+                    info.ldn = ldnInfo;
                     onConnected(header, info);
                 }
                 break;
@@ -153,8 +158,11 @@ namespace ams::mitm::ldn::ryuldn {
             case PacketId::SyncNetwork:
                 LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling SyncNetwork");
                 if (onSyncNetwork) {
+                    LdnNetworkInfo ldnInfo;
+                    ParseNetworkInfo(data, header.dataSize, ldnInfo);
                     NetworkInfo info;
-                    ParseStruct(data, info);
+                    std::memset(&info, 0, sizeof(info));
+                    info.ldn = ldnInfo;
                     onSyncNetwork(header, info);
                 }
                 break;
@@ -162,8 +170,11 @@ namespace ams::mitm::ldn::ryuldn {
             case PacketId::ScanReply:
                 LOG_DBG(COMP_RLDN_PROTOCOL,"  -> Handling ScanReply");
                 if (onScanReply) {
+                    LdnNetworkInfo ldnInfo;
+                    ParseNetworkInfo(data, header.dataSize, ldnInfo);
                     NetworkInfo info;
-                    ParseStruct(data, info);
+                    std::memset(&info, 0, sizeof(info));
+                    info.ldn = ldnInfo;
                     onScanReply(header, info);
                 }
                 break;
